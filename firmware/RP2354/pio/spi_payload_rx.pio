@@ -1,0 +1,16 @@
+.program spi_payload_rx
+
+; SPI mode 3 receive-only
+; ESP waits for RP_READY before starting packet.
+;
+; MOSI = RP GPIO12
+; CS   = RP GPIO13
+; SCK  = RP GPIO14
+
+.wrap_target
+bitloop:
+    wait 0 gpio 13
+    wait 0 gpio 14
+    wait 1 gpio 14
+    in pins, 1
+.wrap

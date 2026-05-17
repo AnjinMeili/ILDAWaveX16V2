@@ -1,0 +1,206 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
+
+#include "hardware/gpio.h"
+#include "hardware/uart.h"
+
+#include "ring_buffer.h"
+#include "stream_rx.h"
+#include "output_engine.h"
+#include "rp_uart.h"
+#include "rp_settings.h"
+#include "config.h"
+
+#define RP_UART_PORT      uart1
+#define RP_UART_TX_GPIO   4
+#define RP_UART_RX_GPIO   5
+#define RP_UART_BAUD_RATE 921600
+
+static bool parse_u32_arg(const char *line, const char *key, uint32_t *out)
+{
+    const char *p = strstr(line, key);
+
+    if (!p || !out) {
+        return false;
+    }
+
+    p += strlen(key);
+    *out = (uint32_t)strtoul(p, NULL, 10);
+    return true;
+}
+
+static void save_current_settings(void)
+{
+    bool mx, my;
+
+    output_engine_get_mirror(&mx, &my);
+
+    rp_settings_save(ring_get_capacity(),
+                     ring_get_high_water(),
+                     ring_get_low_water(),
+                     mx,
+                     my);
+}
+
+void rp_uart_init(void)
+{
+    uart_init(RP_UART_PORT, RP_UART_BAUD_RATE);
+
+    gpio_set_function(RP_UART_TX_GPIO, GPIO_FUNC_UART);
+    gpio_set_function(RP_UART_RX_GPIO, GPIO_FUNC_UART);
+
+    uart_set_format(RP_UART_PORT, 8, 1, UART_PARITY_NONE);
+    uart_set_fifo_enabled(RP_UART_PORT, true);
+}
+
+void uart_send_line(const char *s)
+{
+    uart_puts(RP_UART_PORT, s);
+    uart_puts(RP_UART_PORT, "\n");
+    uart_tx_wait_blocking(RP_UART_PORT);
+}
+
+static void send_status(void)
+{
+    char line[512];
+
+    stream_rx_status_t rx;
+    output_engine_status_t out;
+
+    stream_rx_get_status(&rx);
+    output_engine_get_status(&out);
+
+    snprintf(line, sizeof(line),
+        "STATUS "
+        "running=%lu "
+        "rate=%lu "
+        "fill=%lu "
+        "buffer_size=%lu "
+        "buffer_high_water=%lu "
+        "buffer_low_water=%lu "
+        "buffer_max=%lu "
+        "underruns=%lu "
+        "payload_errors=%lu "
+        "stream_packets=%lu "
+        "bad_packets=%lu "
+        "dropped_packets=%lu "
+        "rx_timeouts=%lu "
+        "mirror_x=%lu "
+        "mirror_y=%lu",
+        out.running ? 1ul : 0ul,
+        (unsigned long)out.sample_rate_hz,
+        (unsigned long)ring_get_fill(),
+        (unsigned long)ring_get_capacity(),
+        (unsigned long)ring_get_high_water(),
+        (unsigned long)ring_get_low_water(),
+        (unsigned long)RP_RING_SAMPLES,
+        (unsigned long)out.underruns,
+        (unsigned long)rx.payload_errors,
+        (unsigned long)rx.stream_packets,
+        (unsigned long)rx.stream_bad_packets,
+        (unsigned long)rx.stream_dropped_packets,
+        (unsigned long)rx.stream_rx_timeouts,
+        out.mirror_x ? 1ul : 0ul,
+        out.mirror_y ? 1ul : 0ul
+    );
+
+    uart_send_line(line);
+}
+
+static void handle_line(char *line)
+{
+    if (strcmp(line, "VERSION") == 0) {
+        uart_send_line("VERSION " RP_FW_VERSION);
+        return;
+    }
+
+    if (strcmp(line, "PING") == 0) {
+        uart_send_line("PONG");
+        return;
+    }
+
+    if (strcmp(line, "STATUS") == 0) {
+        send_status();
+        return;
+    }
+
+    if (strcmp(line, "START") == 0) {
+        output_engine_start();
+        uart_send_line("OK START");
+        return;
+    }
+
+    if (strcmp(line, "STOP") == 0) {
+        output_engine_stop_safe();
+        uart_send_line("OK STOP");
+        return;
+    }
+
+    if (strcmp(line, "CLEAR") == 0) {
+        output_engine_stop_safe();
+        uart_send_line("OK CLEAR");
+        return;
+    }
+
+    if (strncmp(line, "RATE ", 5) == 0) {
+        uint32_t rate = (uint32_t)strtoul(&line[5], NULL, 10);
+        output_engine_set_rate(rate);
+        uart_send_line("OK RATE");
+        return;
+    }
+
+    if (strncmp(line, "BUFFER ", 7) == 0) {
+        uint32_t size      = ring_get_capacity();
+        uint32_t high_water = ring_get_high_water();
+        uint32_t low_water  = ring_get_low_water();
+
+        parse_u32_arg(line, "size=",       &size);
+        parse_u32_arg(line, "high_water=", &high_water);
+        parse_u32_arg(line, "low_water=",  &low_water);
+
+        output_engine_stop_safe();
+        ring_configure(size, high_water, low_water);
+        save_current_settings();
+        uart_send_line("OK BUFFER");
+        return;
+    }
+
+    if (strncmp(line, "MIRROR ", 7) == 0) {
+        uint32_t vx = 0;
+        uint32_t vy = 0;
+
+        parse_u32_arg(line, "x=", &vx);
+        parse_u32_arg(line, "y=", &vy);
+
+        output_engine_set_mirror(vx != 0, vy != 0);
+        save_current_settings();
+        uart_send_line("OK MIRROR");
+        return;
+    }
+
+    uart_send_line("ERR UNKNOWN");
+}
+
+void rp_uart_poll(void)
+{
+    static char line[128];
+    static int pos = 0;
+
+    while (uart_is_readable(RP_UART_PORT)) {
+        char c = uart_getc(RP_UART_PORT);
+
+        if (c == '\n') {
+            line[pos] = '\0';
+
+            if (pos > 0) {
+                handle_line(line);
+            }
+
+            pos = 0;
+        } else if (c != '\r' && pos < (int)sizeof(line) - 1) {
+            line[pos++] = c;
+        }
+    }
+}

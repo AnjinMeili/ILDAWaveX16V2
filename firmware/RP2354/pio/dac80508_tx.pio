@@ -1,0 +1,27 @@
+.program dac80508_tx
+.side_set 2
+
+; side-set bit0 = CS
+; side-set bit1 = SCK
+; OUT pin = MOSI
+;
+; Each FIFO word contains one 24-bit DAC command left-aligned:
+; bits 31..8 = command
+; bits 7..0  = unused
+;
+; Generates:
+; CS low
+; 24 SCLK pulses
+; CS high
+
+.wrap_target
+    pull block        side 0b01
+    set x, 23        side 0b00
+
+bitloop:
+    out pins, 1      side 0b00
+    nop              side 0b10
+    jmp x-- bitloop  side 0b00
+
+    nop              side 0b01
+.wrap
