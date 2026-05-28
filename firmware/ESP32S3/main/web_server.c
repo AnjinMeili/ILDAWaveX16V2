@@ -238,6 +238,11 @@ static esp_err_t read_request_body(httpd_req_t *req, char *body, size_t body_len
 
 static esp_err_t sd_list_get_handler(httpd_req_t *req)
 {
+    (void)sd_manager_rescan();
+
+    sd_status_t sd = {0};
+    sd_manager_get_status(&sd);
+
     char *json = malloc(WEB_SD_LIST_JSON_BYTES);
     if (!json) {
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
@@ -245,6 +250,13 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
 
     size_t off = 0;
     int count = 0;
+
+    if (!sd.mounted) {
+        free(json);
+        set_common_response_headers(req);
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"mounted\":false,\"count\":0,\"files\":[]}");
+    }
 
     DIR *dir = opendir("/sdcard");
 
@@ -1017,7 +1029,7 @@ static const char *html_page =
 ".bufferTop{padding:5px 7px}.bufferMeter{position:relative;width:180px;height:26px;border:1px solid var(--line);border-radius:4px;overflow:hidden;background:#0e1317}.bufferFill{position:absolute;left:0;top:0;bottom:0;background:rgba(74,163,255,.45);transition:width .25s,background .3s}.bufferMark{position:absolute;top:0;bottom:0;width:2px}.bufferMark.low{background:#22e882}.bufferMark.high{background:#f0b44c}.bufferText{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:11px;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.95);font-family:'Consolas','SF Mono','Roboto Mono',monospace;letter-spacing:.02em}"
 ".startBtn{background:var(--green)!important;color:#fff!important;font-weight:900;border:0!important;border-radius:6px;padding:9px 12px!important;font-family:inherit}.stopBtn{background:var(--red)!important;color:#fff!important;font-weight:900;border:0!important;border-radius:6px;padding:9px 12px!important;font-family:inherit}.refreshBtn{background:#2d3740;color:#cdd8e0;border:1px solid var(--line);border-radius:6px;padding:9px 12px;cursor:pointer;font-family:inherit;font-size:12px;font-weight:700}.refreshBtn:hover{filter:brightness(1.18)}.content{padding:26px 34px;flex:1}.crumb{font-size:12px;color:#b8c2ca;margin-bottom:13px}.crumb span{color:var(--green2)}"
 ".section{display:none}.section.active{display:block}.grid2{display:grid;grid-template-columns:1fr 1fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:5px;margin-bottom:18px}"
-".card h3{font-size:14px;margin:0;padding:13px 15px;border-bottom:1px solid var(--line);font-weight:700}.rows{padding:8px 15px 15px}.rowkv{display:grid;grid-template-columns:1.2fr 1fr;gap:10px;border-bottom:1px solid var(--line);padding:9px 0}.rowkv:last-child{border-bottom:0}.k{font-weight:700;color:#fff}.v{color:#fff;font-variant-numeric:tabular-nums}.muted{color:var(--muted)}"
+".card h3{font-size:14px;margin:0;padding:13px 15px;border-bottom:1px solid var(--line);font-weight:700}.cardHead{display:flex;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line);padding:8px 15px}.cardHead h3{padding:0;border-bottom:0}.rows{padding:8px 15px 15px}.rowkv{display:grid;grid-template-columns:1.2fr 1fr;gap:10px;border-bottom:1px solid var(--line);padding:9px 0}.rowkv:last-child{border-bottom:0}.k{font-weight:700;color:#fff}.v{color:#fff;font-variant-numeric:tabular-nums}.muted{color:var(--muted)}"
 ".status-ok{color:var(--green2)}.status-warn{color:var(--amber)}.status-bad{color:var(--red)}button{background:#2d3740;color:#fff;border:1px solid var(--line);border-radius:5px;padding:9px 12px;margin:3px;cursor:pointer;font-family:inherit}button:hover{filter:brightness(1.12)}button.green{background:var(--green);border-color:var(--green)}button.red{background:var(--red);border-color:var(--red)}button.blue{background:#246aa5;border-color:#246aa5}button.toggle{min-width:68px;font-weight:600;transition:background .15s,border-color .15s,color .15s,opacity .15s}button.toggle.red{background:#2d1a1a;border-color:#6a2a2a;color:#f07070}button.toggle.green{background:#1a2d1a;border-color:#2a6a2a;color:#52e899}button.toggle.blue{background:#1a1a2d;border-color:#2a2a6a;color:#6ab0ff}button.toggle.black{background:#101418;border-color:#3a424a;color:#8a9499}button.toggle.active.red{background:#b03030;border-color:#d04040;color:#fff}button.toggle.active.green{background:var(--green);border-color:#1dbf73;color:#fff}button.toggle.active.blue{background:#1e5a95;border-color:#4aa3ff;color:#fff}button.toggle.active.black{background:#252c33;border-color:#5a6570;color:#dce4ea}.rateGrid{display:grid;grid-template-columns:repeat(5,minmax(70px,1fr));gap:8px;margin-bottom:9px}.rateGrid button{margin:0}"
 "input,select{background:#171c21;color:#fff;border:1px solid var(--line);border-radius:5px;padding:8px;width:100%;font-family:inherit}.actions{padding:12px 15px}.pill{display:inline-block;border:1px solid var(--line);border-radius:4px;padding:3px 7px;margin:2px;color:#dce4ea}.inlineForm{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-top:10px}"
 ".checkrow{display:flex;align-items:center;gap:9px;padding:4px 0}.checkrow input{width:auto}.fieldrow{display:grid;grid-template-columns:1.2fr 1fr;gap:10px;align-items:center;border-bottom:1px solid var(--line);padding:9px 0}.fieldrow:last-child{border-bottom:0}.ipFields{display:none}.saveMsg{min-height:20px;color:var(--muted);padding:0 15px 12px}.saveMsg.ok{color:var(--green2)}.saveMsg.err{color:var(--red)}.note{color:var(--muted);font-size:12px;line-height:1.4;padding:0 15px 12px}"
@@ -1104,7 +1116,7 @@ static const char *html_page =
 "</section>"
 
 "<section id='playback' class='section'>"
-"<div class='card filesCard'><h3>SD playback</h3>"
+"<div class='card filesCard'><div class='cardHead'><h3>SD playback</h3><button class='refreshBtn' onclick='loadSdFiles()'>Rescan SD Card</button></div>"
 "<div class='tableWrap'><table class='sdTable'><thead><tr><th>Name</th><th class='sizeCol'>Size</th><th class='actionCol'>Action</th></tr></thead><tbody id='fileRows'></tbody></table></div>"
 "</div>"
 "</section>"

@@ -43,7 +43,11 @@ static bool ends_with_ild(const char *name)
 
 static bool sd_card_inserted_raw(void)
 {
+#if BOARD_VERSION == 1
+    return true;
+#else
     return gpio_get_level(SD_DET_GPIO) == 0;
+#endif
 }
 
 static bool sd_card_inserted_debounced(void)
@@ -180,13 +184,25 @@ esp_err_t sd_manager_rescan(void)
     s_status.file_count = 0;
 
     if (!s_status.mounted) {
+#if BOARD_VERSION == 1
+        s_status.inserted = true;
+        esp_err_t ret = sd_mount_locked();
+        if (ret != ESP_OK) {
+            xSemaphoreGive(s_sd_mutex);
+            return ret;
+        }
+#else
         xSemaphoreGive(s_sd_mutex);
         return ESP_ERR_INVALID_STATE;
+#endif
     }
 
     DIR *dir = opendir(SD_MOUNT_POINT);
     if (!dir) {
         ESP_LOGE(TAG, "Failed to open SD root directory");
+#if BOARD_VERSION == 1
+        sd_unmount_locked();
+#endif
         xSemaphoreGive(s_sd_mutex);
         return ESP_FAIL;
     }
@@ -248,6 +264,7 @@ void sd_manager_get_status(sd_status_t *status)
     xSemaphoreGive(s_sd_mutex);
 }
 
+#if BOARD_VERSION != 1
 static void sd_hotplug_task(void *arg)
 {
     bool last_inserted = false;
@@ -281,6 +298,7 @@ static void sd_hotplug_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 }
+#endif
 
 esp_err_t sd_manager_start(void)
 {
@@ -291,6 +309,7 @@ esp_err_t sd_manager_start(void)
         return ESP_ERR_NO_MEM;
     }
 
+#if BOARD_VERSION != 1
     gpio_config_t cfg = {
         .pin_bit_mask = 1ULL << SD_DET_GPIO,
         .mode = GPIO_MODE_INPUT,
@@ -300,6 +319,7 @@ esp_err_t sd_manager_start(void)
     };
 
     ESP_ERROR_CHECK(gpio_config(&cfg));
+#endif
 
     xSemaphoreTake(s_sd_mutex, portMAX_DELAY);
 
@@ -321,6 +341,7 @@ esp_err_t sd_manager_start(void)
         xSemaphoreGive(s_sd_mutex);
     }
 
+#if BOARD_VERSION != 1
     xTaskCreate(
         sd_hotplug_task,
         "sd_hotplug",
@@ -329,6 +350,7 @@ esp_err_t sd_manager_start(void)
         4,
         NULL
     );
+#endif
 
     return ESP_OK;
 }
