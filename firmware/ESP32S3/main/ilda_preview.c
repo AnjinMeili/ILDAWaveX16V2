@@ -16,6 +16,7 @@ static const char *TAG = "ilda_preview";
 #define ILDA_PREVIEW_CACHE_PATH_MAX 192
 #define ILDA_PREVIEW_READ_BYTES 4096
 #define ILDA_HEADER_BYTES 32
+#define ILDA_PREVIEW_EVEN_POINTS (ILDA_PREVIEW_MAX_POINTS / 2)
 
 typedef struct {
     uint32_t payload_offset;
@@ -70,8 +71,12 @@ static esp_err_t read_preview_frame(FILE *file, uint8_t format,
 
     int record_size = ilda_record_size_for_format(format);
     size_t records_per_chunk = ILDA_PREVIEW_READ_BYTES / (size_t)record_size;
+    bool decimate = record_count > ILDA_PREVIEW_MAX_POINTS;
     uint16_t processed = 0;
     uint32_t preview_slot = 0;
+    uint32_t even_slot = 0;
+    ilda_preview_point_t previous = {0};
+    bool previous_captured = false;
 
     result->selected_frame_points = record_count;
     result->preview_point_count = 0;
@@ -89,20 +94,37 @@ static esp_err_t read_preview_frame(FILE *file, uint8_t format,
         }
 
         /*
-           Frames larger than ILDA_PREVIEW_MAX_POINTS are decimated evenly,
-           always keeping the first and last point.
+           Frames larger than ILDA_PREVIEW_MAX_POINTS are decimated: half the
+           budget goes to evenly spaced points, always keeping the first and
+           last, and the rest keeps both ends of every blank/lit change so
+           short lit segments survive.
         */
         for (size_t i = 0; i < batch_count; i++) {
             uint32_t record_index = (uint32_t)processed + (uint32_t)i;
-            bool capture = record_count <= ILDA_PREVIEW_MAX_POINTS ||
-                record_index == (preview_slot * (record_count - 1U)) /
-                                (ILDA_PREVIEW_MAX_POINTS - 1U);
+            ilda_preview_point_t point;
+            bool capture = !decimate;
+
+            decode_point(format, &records_buffer[i * (size_t)record_size], &point);
+
+            if (decimate && record_index == (even_slot * (record_count - 1U)) /
+                                            (ILDA_PREVIEW_EVEN_POINTS - 1U)) {
+                capture = true;
+                even_slot++;
+            }
+
+            if (decimate && record_index > 0 && point.blanked != previous.blanked) {
+                if (!previous_captured && preview_slot < ILDA_PREVIEW_MAX_POINTS) {
+                    result->points[preview_slot++] = previous;
+                }
+                capture = true;
+            }
 
             if (capture && preview_slot < ILDA_PREVIEW_MAX_POINTS) {
-                decode_point(format, &records_buffer[i * (size_t)record_size],
-                             &result->points[preview_slot]);
-                preview_slot++;
+                result->points[preview_slot++] = point;
             }
+
+            previous = point;
+            previous_captured = capture;
         }
 
         result->preview_point_count = preview_slot;
