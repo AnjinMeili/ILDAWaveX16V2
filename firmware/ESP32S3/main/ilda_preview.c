@@ -97,7 +97,9 @@ static esp_err_t read_preview_frame(FILE *file, uint8_t format,
            Frames larger than ILDA_PREVIEW_MAX_POINTS are decimated: half the
            budget goes to evenly spaced points, always keeping the first and
            last, and the rest keeps both ends of every blank/lit change so
-           short lit segments survive.
+           short lit segments survive. Slots for the evenly spaced points
+           still to come stay reserved, so transitions never crowd out the
+           end of the frame.
         */
         for (size_t i = 0; i < batch_count; i++) {
             uint32_t record_index = (uint32_t)processed + (uint32_t)i;
@@ -113,10 +115,15 @@ static esp_err_t read_preview_frame(FILE *file, uint8_t format,
             }
 
             if (decimate && record_index > 0 && point.blanked != previous.blanked) {
-                if (!previous_captured && preview_slot < ILDA_PREVIEW_MAX_POINTS) {
-                    result->points[preview_slot++] = previous;
+                uint32_t reserved = ILDA_PREVIEW_EVEN_POINTS - even_slot;
+                uint32_t needed = (previous_captured ? 0U : 1U) + 1U;
+
+                if (preview_slot + needed + reserved <= ILDA_PREVIEW_MAX_POINTS) {
+                    if (!previous_captured) {
+                        result->points[preview_slot++] = previous;
+                    }
+                    capture = true;
                 }
-                capture = true;
             }
 
             if (capture && preview_slot < ILDA_PREVIEW_MAX_POINTS) {
