@@ -387,6 +387,16 @@ static void rp_poll_task(void *arg)
 static int16_t    s_feed_packet[RP_STREAM_SAMPLES_PER_PACKET][RP_SAMPLE_CHANNELS];
 static ed_point_t s_feed_stage[RP_STREAM_SAMPLES_PER_PACKET];
 
+/* START the RP on the samples already queued and seed the queue estimate. */
+static void feed_output_start(uint32_t queued)
+{
+    rp_manager_output_start();
+    s_rp_sent = 0;
+    rp_snapshot_set(esp_timer_get_time(), queued, 0);
+    s_rp_output_started = true;
+    ESP_LOGI(TAG, "RP output started");
+}
+
 static void feed_task(void *arg)
 {
     (void)arg;
@@ -440,7 +450,14 @@ static void feed_task(void *arg)
                 last_growth_us = now_us;
             }
 
-            if (avail == 0 || now_us - last_growth_us < ED_FEED_FLUSH_US) {
+            bool idle = now_us - last_growth_us >= ED_FEED_FLUSH_US;
+
+            if (avail == 0 || !idle) {
+                /* A stream that idles on a packet boundary has no tail to flush; start what is queued. */
+                if (avail == 0 && idle && !output_started && queued_before_start > 0) {
+                    feed_output_start(queued_before_start);
+                    output_started = true;
+                }
                 vTaskDelay(1);
                 continue;
             }
@@ -473,12 +490,8 @@ static void feed_task(void *arg)
             /* Start once a short cushion is queued, or when a short stream is flushed. */
             if (!output_started &&
                 (queued_before_start >= ED_FEED_PREBUFFER || got < RP_STREAM_SAMPLES_PER_PACKET)) {
-                rp_manager_output_start();
+                feed_output_start(queued_before_start);
                 output_started = true;
-                s_rp_sent = 0;
-                rp_snapshot_set(esp_timer_get_time(), queued_before_start, 0);
-                s_rp_output_started = true;
-                ESP_LOGI(TAG, "RP output started");
             } else if (output_started) {
                 s_rp_sent += RP_STREAM_SAMPLES_PER_PACKET;
             }

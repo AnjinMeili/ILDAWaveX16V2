@@ -557,7 +557,15 @@ static void feed_task(void *arg)
                 last_growth_us = now_us;
             }
 
-            if (avail == 0 || now_us - last_growth_us < IDN_FEED_FLUSH_US) {
+            bool idle = now_us - last_growth_us >= IDN_FEED_FLUSH_US;
+
+            if (avail == 0 || !idle) {
+                /* A stream that idles on a packet boundary has no tail to flush; start what is queued. */
+                if (avail == 0 && idle && !output_started && queued_before_start > 0) {
+                    rp_manager_output_start();
+                    output_started = true;
+                    ESP_LOGI(TAG, "IDN RP output started");
+                }
                 vTaskDelay(1);
                 continue;
             }
