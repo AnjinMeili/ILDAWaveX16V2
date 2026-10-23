@@ -611,7 +611,11 @@ static void feed_task(void *arg)
         taskYIELD();
     }
 
-    rp_manager_output_stop();
+    /* Release only a START this feed made; otherwise drop its prebuffer. */
+    if (output_started)
+        rp_manager_output_stop();
+    else if (queued_before_start > 0)
+        rp_manager_output_discard_unstarted();
     ESP_LOGI(TAG, "IDN feed task exiting");
     s_feed_task_h = NULL;
     vTaskDelete(NULL);
