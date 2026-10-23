@@ -747,6 +747,19 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
         return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
     }
 
+    /* Report the playing file relative to the card root, as the SD list does. */
+    char ilda_file[ILDA_PATH_MAX];
+    bool ilda_folder = false;
+    ilda_player_get_current(ilda_file, sizeof(ilda_file), &ilda_folder);
+
+    const char *ilda_relative = ilda_file;
+    if (strncmp(ilda_file, SD_MOUNT_POINT "/", sizeof(SD_MOUNT_POINT)) == 0) {
+        ilda_relative = ilda_file + sizeof(SD_MOUNT_POINT);
+    }
+
+    char escaped_ilda_file[ILDA_PATH_MAX * 2];
+    json_escape(ilda_relative, escaped_ilda_file, sizeof(escaped_ilda_file));
+
     snprintf(json, WEB_RP_STATUS_JSON_BYTES,
         "{"
             "\"product\":\"%s\","
@@ -776,7 +789,9 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
             "\"stream_etherdream_samples\":%lu,"
             "\"stream_ilw_samples\":%lu,"
             "\"test_stream_running\":%s,"
-            "\"ilda_running\":%s"
+            "\"ilda_running\":%s,"
+            "\"ilda_file\":\"%s\","
+            "\"ilda_folder\":%s"
         "}",
         PRODUCT_NAME,
         FW_VERSION,
@@ -805,7 +820,9 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
         (unsigned long)streams.etherdream_samples,
         (unsigned long)streams.ilw_samples,
         rp.test_stream_running ? "true" : "false",
-        ilda_player_is_running() ? "true" : "false"
+        ilda_player_is_running() ? "true" : "false",
+        escaped_ilda_file,
+        ilda_folder ? "true" : "false"
     );
 
     set_common_response_headers(req);
@@ -1377,13 +1394,24 @@ static esp_err_t rp_mirror_config_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "OK");
 }
 
-static bool parse_scale_percent(const char *value, uint8_t *scale_percent)
+static bool parse_u32_in_range(const char *value, uint32_t min, uint32_t max, uint32_t *out)
 {
     char *end = NULL;
     unsigned long parsed = strtoul(value, &end, 10);
 
-    if (value[0] == '\0' || !end || *end != '\0' ||
-        parsed < ILDA_SCALE_MIN_PERCENT || parsed > ILDA_SCALE_MAX_PERCENT) {
+    if (value[0] == '\0' || !end || *end != '\0' || parsed < min || parsed > max) {
+        return false;
+    }
+
+    *out = (uint32_t)parsed;
+    return true;
+}
+
+static bool parse_scale_percent(const char *value, uint8_t *scale_percent)
+{
+    uint32_t parsed;
+
+    if (!parse_u32_in_range(value, ILDA_SCALE_MIN_PERCENT, ILDA_SCALE_MAX_PERCENT, &parsed)) {
         return false;
     }
 
@@ -1436,6 +1464,61 @@ static esp_err_t ilda_scale_post_handler(httpd_req_t *req)
     return send_plain_result(req, ilda_player_set_scale(scale_percent));
 }
 
+static esp_err_t ilda_folder_post_handler(httpd_req_t *req)
+{
+    char query[WEB_SD_REL_PATH_MAX * 3 + 96];
+    char encoded_path[WEB_SD_REL_PATH_MAX * 3 + 1];
+    char value[16];
+    char full_path[WEB_SD_PATH_MAX + 1];
+    uint32_t hold_s = ILDA_FOLDER_HOLD_DEFAULT_S;
+    uint32_t plays = ILDA_FOLDER_PLAYS_DEFAULT;
+    uint8_t scale_percent = ILDA_SCALE_MAX_PERCENT;
+    bool recursive = false;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "path", encoded_path, sizeof(encoded_path)) != ESP_OK) {
+        return send_bad_request(req, "A folder path is required");
+    }
+
+    url_decode_inplace(encoded_path);
+    if (!valid_sd_relative_path(encoded_path)) {
+        return send_bad_request(req, "Invalid SD folder path");
+    }
+
+    if (httpd_query_key_value(query, "hold", value, sizeof(value)) == ESP_OK &&
+        !parse_u32_in_range(value, 1, ILDA_FOLDER_HOLD_MAX_S, &hold_s)) {
+        return send_bad_request(req, "Hold time must be between 1 and 3600 seconds");
+    }
+
+    if (httpd_query_key_value(query, "plays", value, sizeof(value)) == ESP_OK &&
+        !parse_u32_in_range(value, 1, ILDA_FOLDER_PLAYS_MAX, &plays)) {
+        return send_bad_request(req, "Animation plays must be between 1 and 1000");
+    }
+
+    if (httpd_query_key_value(query, "scale", value, sizeof(value)) == ESP_OK &&
+        !parse_scale_percent(value, &scale_percent)) {
+        return send_bad_request(req, "XY scale must be between 10 and 100 percent");
+    }
+
+    if (httpd_query_key_value(query, "recursive", value, sizeof(value)) == ESP_OK) {
+        recursive = form_value_enabled(value);
+    }
+
+    int path_len = encoded_path[0]
+        ? snprintf(full_path, sizeof(full_path), "%s/%s", SD_MOUNT_POINT, encoded_path)
+        : snprintf(full_path, sizeof(full_path), "%s", SD_MOUNT_POINT);
+    if (path_len < 0 || (size_t)path_len >= sizeof(full_path)) {
+        return send_bad_request(req, "SD folder path is too long");
+    }
+
+    rp_manager_stop_test_stream();
+
+    return send_plain_result(req, ilda_player_start_folder(full_path, recursive,
+                                                           hold_s * 1000U,
+                                                           (uint16_t)plays,
+                                                           scale_percent));
+}
+
 static esp_err_t ilda_stop_post_handler(httpd_req_t *req)
 {
     return send_plain_result(req, stop_everything_safe());
@@ -1469,6 +1552,7 @@ static const char *html_page =
 ".fileTools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.fileTools button{margin:0}.tableWrap{overflow:auto;padding:0 15px 15px}.tableWrap table{min-width:100%}"
 ".sdTable .previewBtn{margin:0 5px 0 0;padding:6px 9px}.sdTable tr.previewSelected td{background:#28332f}"
 ".previewGrid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(240px,1fr);gap:16px;padding:15px}.previewCanvasWrap{background:#080b0d;border:1px solid var(--line);border-radius:4px;overflow:hidden}.previewCanvasWrap canvas{display:block;width:100%;height:auto;aspect-ratio:8/5}.previewSummary{min-width:0}.previewSummary .rowkv{grid-template-columns:1fr auto;gap:8px}.previewVerdict{padding:12px 0 0;font-weight:700}.previewVerdict.ok{color:var(--green2)}.previewVerdict.warn{color:var(--amber)}.previewVerdict.err{color:var(--red)}.previewFrameLabel{min-width:90px;text-align:center;font-variant-numeric:tabular-nums}"
+".folderPlay{display:flex;flex-wrap:wrap;align-items:center;gap:8px 14px;padding-top:0}.folderPlay button{margin:0}.folderPlay label{display:flex;align-items:center;gap:6px;color:var(--muted)}.folderPlay input[type=number]{width:72px;padding:6px}.folderPlay input[type=checkbox]{width:auto}"
 ".scaleControl{display:flex;align-items:center;gap:10px}.scaleControl input{width:100%;padding:0}.scaleControl output{min-width:44px;text-align:right;font-variant-numeric:tabular-nums}.previewSummary .scaleRow{grid-template-columns:1fr;gap:7px}"
 "table{width:100%;border-collapse:collapse}.card>table{width:calc(100% - 30px);margin:0 15px 15px}.sdTable{min-width:420px}.sdTable .sizeCol{width:92px}.sdTable .actionCol{width:150px;text-align:right}.sdTable .sizeCell{white-space:nowrap;color:#dce4ea}.sdTable .actionCell{text-align:right}.sdTable .playBtn{margin:0;padding:6px 10px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}th{font-size:12px;color:#dce4ea}.bufInputCol{width:140px}.bufInfoCol{width:120px;white-space:nowrap}.bufInfo{color:var(--muted);font-variant-numeric:tabular-nums}.bufDesc{font-size:12px}.bufActions{display:flex;align-items:center;gap:4px}.bufActions .saveMsg{padding:0 8px;margin:0}"
 "pre{margin:0;background:#14191e;color:#9dffbc;padding:13px;max-height:420px;overflow:auto;font-size:12px}.footer{margin-top:auto;border-top:1px solid #171b20;background:#1a2025;text-align:center;padding:14px 16px;font-size:12px}.footerLink{color:#fff;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.footerLink:hover{color:#fff}.footerLogo{width:112px;height:auto;display:block}"
@@ -1554,6 +1638,7 @@ static const char *html_page =
 "<section id='playback' class='section'>"
 "<div class='card filesCard'><div class='cardHead'><h3>SD playback</h3><button class='refreshBtn' onclick='loadSdFiles()'>Rescan SD Card</button></div>"
 "<div class='actions' style='padding-top:0'><button id='sdUpBtn' onclick='goSdParent()'>Up</button><span id='sdCurrentPath' class='muted'>/</span></div>"
+"<div class='actions folderPlay'><button id='sdPlayFolderBtn' class='green' onclick='playSdFolder()'>Play folder</button><label>Hold single frames <input id='folderHold' type='number' min='1' max='3600' step='1' value='5'> s</label><label>Play animations <input id='folderPlays' type='number' min='1' max='1000' step='1' value='1'> times</label><label><input id='folderRecursive' type='checkbox'> Include subfolders</label><span id='folderPlayMsg' class='muted'></span></div>"
 "<div class='tableWrap'><table class='sdTable'><thead><tr><th>Name</th><th class='sizeCol'>Size</th><th class='actionCol'>Action</th></tr></thead><tbody id='fileRows'></tbody></table></div>"
 "</div>"
 "<div class='card' id='ildaPreviewCard' style='display:none'><div class='cardHead'><h3 id='ildaPreviewTitle'>ILDA preview</h3><div class='fileTools'><button id='previewProjectBtn' class='green' onclick='startPreviewProject()' disabled>Project</button><button id='previewStopBtn' class='red' onclick='stopPreviewProject()' disabled>Stop</button><button id='previewPrevBtn' onclick='stepPreviewFrame(-1)' aria-label='Previous frame'>Previous</button><button id='previewPlayBtn' onclick='togglePreviewPlayback()' aria-label='Pause preview' aria-pressed='true'>Pause</button><span id='previewFrameLabel' class='previewFrameLabel muted'>Frame --</span><button id='previewNextBtn' onclick='stepPreviewFrame(1)' aria-label='Next frame'>Next</button></div></div>"
@@ -1683,13 +1768,16 @@ static const char *html_page =
 "function forceSyncBufInputs(j){let size=Number(j.remote_buffer_size_samples||0);let high=Number(j.remote_buffer_high_water_samples||0);let low=Number(j.remote_buffer_low_water_samples||0);if(size&&!high)high=defaultHigh(size);setVal('bufSizeInput',size||'');setVal('bufHighInput',high||'');setVal('bufLowInput',low);}"
 "function saveBufferSettings(){let size=Number(val('bufSizeInput'));let high=Number(val('bufHighInput'));let low=Number(val('bufLowInput'));let max=lastRpStatus?Number(lastRpStatus.remote_buffer_max_samples||0):0;if(!Number.isInteger(size)||!Number.isInteger(high)||!Number.isInteger(low)||size<512||high<256||low<0){setBufMsg('Enter valid whole-number buffer limits','err');return;}if(max&&size>max){setBufMsg('Buffer size is above the RP maximum','err');return;}if(high>size-256){setBufMsg('High-water limit must leave at least 256 samples of headroom','err');return;}if(low>high-256){setBufMsg('Low-water limit must be at least 256 samples below high-water','err');return;}let p=new URLSearchParams();p.set('size',size);p.set('high_water',high);p.set('low_water',low);setBufMsg('Saving to RP flash...','ok');return fetch('/api/rp/buffer_config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()}).then(r=>r.text().then(t=>{if(!r.ok||!t.startsWith('OK')){throw new Error(t.startsWith('ERR ')?t.substring(4):t);}setBufMsg('Saved and applied.','ok');bufDirty=false;document.getElementById('bufCancelBtn').style.display='none';setTimeout(update,120);return t;})).catch(e=>setBufMsg(e.message||'Save failed','err'));}"
 "function startIldaProject(path,relativePath){let scale=Number(val('ildaScale'))||100;return post('/api/ilda/start?path='+encodeURIComponent(path)+'&scale='+scale).then(result=>{if(result.trim()==='OK'){activePreviewProjectPath=relativePath;syncPreviewProjectControls({ilda_running:true});if(relativePath!==previewPath){selectPreviewRow(relativePath);loadIldaPreview(relativePath,0);}setTimeout(update,120);}else if(relativePath!==previewPath){selectPreviewRow(relativePath);loadIldaPreview(relativePath,0);}else{setText('previewVerdict','Play failed: '+result);setClass('previewVerdict','previewVerdict err');}});}"
+"let lastPlayerFile='';function followPlayer(j){let file=j.ilda_running?(j.ilda_file||''):'';if(file&&file!==lastPlayerFile&&file!==previewPath){selectPreviewRow(file);loadIldaPreview(file,0);}lastPlayerFile=file;}"
+"function loadFolderPrefs(){try{let p=JSON.parse(localStorage.getItem('folderPlay')||'{}');if(p.hold)setVal('folderHold',p.hold);if(p.plays)setVal('folderPlays',p.plays);let r=document.getElementById('folderRecursive');if(r)r.checked=!!p.recursive;}catch(e){}}"
+"function playSdFolder(){let hold=Number(val('folderHold'));let plays=Number(val('folderPlays'));let r=document.getElementById('folderRecursive');let recursive=!!(r&&r.checked);if(!Number.isInteger(hold)||hold<1||hold>3600){setText('folderPlayMsg','Hold must be 1-3600 seconds');return;}if(!Number.isInteger(plays)||plays<1||plays>1000){setText('folderPlayMsg','Animation plays must be 1-1000');return;}try{localStorage.setItem('folderPlay',JSON.stringify({hold:hold,plays:plays,recursive:recursive}));}catch(e){}let scale=Number(val('ildaScale'))||100;setText('folderPlayMsg','Starting...');return post('/api/ilda/play_folder?path='+encodeURIComponent(currentSdPath)+'&hold='+hold+'&plays='+plays+'&recursive='+(recursive?1:0)+'&scale='+scale).then(result=>{setText('folderPlayMsg',result.trim()==='OK'?'':result.trim()==='ERR ESP_ERR_NOT_FOUND'?'No playable ILDA files in this folder':result);setTimeout(update,120);});}"
 "function selectPreviewRow(path){document.querySelectorAll('.sdTable tbody tr').forEach(row=>row.classList.toggle('previewSelected',row.dataset.path===path));}"
 "function playIldaPath(p){let relativePath=p.startsWith('/sdcard/')?p.substring(8):p;startIldaProject(p,relativePath);}"
 "function startPreviewProject(){if(!previewPath)return;startIldaProject('/sdcard/'+previewPath,previewPath);}"
 "function stopPreviewProject(){return post('/api/ilda/stop').then(result=>{if(result.trim()==='OK'){activePreviewProjectPath='';syncPreviewProjectControls({ilda_running:false});setText('previewVerdict','Projection stopped.');setClass('previewVerdict','previewVerdict ok');}else{setText('previewVerdict',result);setClass('previewVerdict','previewVerdict err');}setTimeout(update,120);});}"
 "let previewPath='';let previewFrame=0;let previewFrameCount=0;let previewFramePoints=0;let previewRequestId=0;let previewPlaying=false;let previewTimer=0;let activePreviewProjectPath='';let previewScaleTimer=0;let previewLoopReturnSamples=0;let previewAbort=null;"
 "let previewPoints=[];function onIldaScaleChange(){let scale=Number(val('ildaScale'))||100;let output=document.getElementById('ildaScaleValue');if(output)output.value=scale+'%';drawIldaPreview(previewPoints);if(activePreviewProjectPath===previewPath){if(previewScaleTimer)clearTimeout(previewScaleTimer);previewScaleTimer=setTimeout(()=>{post('/api/ilda/scale?value='+scale).then(result=>{if(result.trim()!=='OK'){setText('previewVerdict',result);setClass('previewVerdict','previewVerdict err');}});},100);}}"
-"function syncPreviewProjectControls(status){let running=!!(status&&status.ilda_running);if(!running)activePreviewProjectPath='';let sameFile=running&&activePreviewProjectPath===previewPath;let start=document.getElementById('previewProjectBtn');let stop=document.getElementById('previewStopBtn');if(start){start.disabled=!previewPath||sameFile;start.textContent=sameFile?'Projecting':'Project';}if(stop)stop.disabled=!running;}"
+"function syncPreviewProjectControls(status){let running=!!(status&&status.ilda_running);if(!running)activePreviewProjectPath='';else if(status.ilda_file)activePreviewProjectPath=status.ilda_file;let sameFile=running&&activePreviewProjectPath===previewPath;let start=document.getElementById('previewProjectBtn');let stop=document.getElementById('previewStopBtn');if(start){start.disabled=!previewPath||sameFile;start.textContent=sameFile?'Projecting':'Project';}if(stop)stop.disabled=!running;}"
 "function setPreviewPlayback(playing){previewPlaying=playing;if(previewTimer)clearTimeout(previewTimer);previewTimer=0;let button=document.getElementById('previewPlayBtn');if(button){button.textContent=playing?'Pause':'Play';button.setAttribute('aria-label',playing?'Pause preview':'Play preview');button.setAttribute('aria-pressed',playing?'true':'false');}if(!playing)previewRequestId++;}"
 "function drawIldaPreview(points){if(points)previewPoints=points;let canvas=document.getElementById('ildaPreviewCanvas');if(!canvas)return;let ctx=canvas.getContext('2d');let w=canvas.width,h=canvas.height;ctx.clearRect(0,0,w,h);ctx.fillStyle='#080b0d';ctx.fillRect(0,0,w,h);let margin=16,size=Math.min(w,h)-margin*2,left=(w-size)/2,top=(h-size)/2,scale=size/65535;ctx.strokeStyle='#202a30';ctx.lineWidth=1;ctx.strokeRect(left,top,size,size);for(let i=1;i<4;i++){let x=left+size*i/4,y=top+size*i/4;ctx.beginPath();ctx.moveTo(x,top);ctx.lineTo(x,top+size);ctx.moveTo(left,y);ctx.lineTo(left+size,y);ctx.stroke();}ctx.strokeStyle='#39464e';ctx.beginPath();ctx.moveTo(left+size/2,top);ctx.lineTo(left+size/2,top+size);ctx.moveTo(left,top+size/2);ctx.lineTo(left+size,top+size/2);ctx.stroke();let xyScale=(Number(val('ildaScale'))||100)/100,previous=null;ctx.lineWidth=1.5;ctx.lineCap='round';ctx.lineJoin='round';previewPoints.forEach(p=>{let point={x:left+(32768+p[0]*xyScale)*scale,y:top+(32767-p[1]*xyScale)*scale,blanked:!!p[5],r:p[2],g:p[3],b:p[4]};if(previous&&!point.blanked){ctx.strokeStyle='rgb('+point.r+','+point.g+','+point.b+')';ctx.beginPath();ctx.moveTo(previous.x,previous.y);ctx.lineTo(point.x,point.y);ctx.stroke();}previous=point;});}"
 "function val(id){let e=document.getElementById(id);return e?e.value:'';}"
@@ -1730,7 +1818,7 @@ static const char *html_page =
 "function syncBufferFields(j){let rpMax=Number(j.remote_buffer_max_samples||0);let rpSize=Number(j.remote_buffer_size_samples||0);let rpHigh=Number(j.remote_buffer_high_water_samples||0);let rpLow=Number(j.remote_buffer_low_water_samples||0);let sizeLimit=rpMax||rpSize;let highLimit=rpSize>256?rpSize-256:0;if(rpSize&&!rpHigh)rpHigh=defaultHigh(rpSize);let lowLimit=rpHigh>256?rpHigh-256:0;setText('bufSizeInfo',rpSize?(rpSize+' / '+sizeLimit):'--');setText('bufHighInfo',rpHigh?(rpHigh+' / '+highLimit):'--');setText('bufLowInfo',rpHigh?(rpLow+' / '+lowLimit):'--');if(!bufDirty){setValIfIdle('bufSizeInput',rpSize||'');setValIfIdle('bufHighInput',rpHigh||'');setValIfIdle('bufLowInput',rpLow);}}"
 "function updateBufferMeter(j){let size=Number(j.remote_buffer_size_samples||0);let fill=Number(j.remote_buffer_fill_samples||0);let low=Number(j.remote_buffer_low_water_samples||0);let high=Number(j.remote_buffer_high_water_samples||0);let lf=size?Math.max(0,Math.min(100,low*100/size)):0;let hf=size?Math.max(lf,Math.min(100,high*100/size)):0;let ff=size?Math.max(0,Math.min(100,fill*100/size)):0;let f=document.getElementById('topBufferFill');let lm=document.getElementById('topBufLowMark');let hm=document.getElementById('topBufHighMark');if(f){f.style.width=ff+'%';f.style.background=!size?'rgba(74,163,255,.35)':fill>=high?'rgba(217,155,40,.55)':fill<low?'rgba(29,191,115,.5)':'rgba(74,163,255,.45)';}if(lm)lm.style.left=lf+'%';if(hm)hm.style.left=hf+'%';}"
 "function render(j){lastRpStatus=j;calcRates(j);setButtonState(j.remote_running);syncBufferFields(j);syncMirrorFields(j);syncSdFiles(j);syncProtocolRates();syncDiagnosticTotals(j);updateBufferMeter(j);let dacEngineOk=!!j.initialized;let dacRun=!!j.remote_running;let bufferText=fmtBuffer(j);if(j.product)document.title=j.product;setText('brandName',j.product);setText('aboutEspFw',j.esp_fw);setText('aboutRpFw',j.rp_fw);setText('topRate',fmtKpps(j.remote_sample_rate));setText('topFill',bufferText);setClass('topConn',dacEngineOk?'topItem ok':'topItem bad');setClass('topState',dacRun?'topItem ok':'topItem bad');setText('dashUnderrunRate',rates.underruns.toFixed(1));setText('dashPayloadRate',rates.payload.toFixed(1));setClass('dashUnderrunRate',rates.underruns>0?'v status-warn':'v status-ok');setClass('dashPayloadRate',rates.payload>0?'v status-bad':'v status-ok');document.getElementById('status').innerText=JSON.stringify(diagnosticStatus(j),null,2);}"
-"function update(){fetch('/api/rp/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{render(j);syncPreviewProjectControls(j);}).catch(e=>{setClass('topConn','topItem bad');});}"
+"function update(){fetch('/api/rp/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{render(j);followPlayer(j);syncPreviewProjectControls(j);}).catch(e=>{setClass('topConn','topItem bad');});}"
 "let previewFrames=[];"
 "function showPreviewFrame(frame){if(frame<0||frame>=previewFrameCount)return;previewFrame=frame;let current=previewFrames[frame];previewFramePoints=Number(current.point_count)||0;setText('previewFrameLabel','Frame '+(frame+1)+' / '+previewFrameCount);setText('previewSelectedPoints',previewFramePoints.toLocaleString());document.getElementById('previewPrevBtn').disabled=frame===0;document.getElementById('previewNextBtn').disabled=frame+1>=previewFrameCount;document.getElementById('previewPlayBtn').disabled=previewFrameCount<2;drawIldaPreview(current.points||[]);}"
 "function previewFrameDurationMs(points,frame){let rate=Number(lastRpStatus&&lastRpStatus.remote_sample_rate)||30000;let samples=Number(points)||0;if(frame===previewFrameCount-1)samples+=previewLoopReturnSamples;return samples*1000/rate;}"
@@ -1738,7 +1826,7 @@ static const char *html_page =
 "function togglePreviewPlayback(){if(previewPlaying){setPreviewPlayback(false);return;}if(!previewPath||previewFrames.length<2)return;setPreviewPlayback(true);schedulePreviewFrame(previewFrame,previewRequestId);}"
 "function stepPreviewFrame(step){let next=previewFrame+step;if(next<0||next>=previewFrameCount)return;if(previewTimer)clearTimeout(previewTimer);previewTimer=0;showPreviewFrame(next);if(previewPlaying)schedulePreviewFrame(next,previewRequestId);}"
 "function loadIldaPreview(path,frame){setPreviewPlayback(true);previewPath=path;let requestedFrame=frame||0;let requestId=++previewRequestId;let card=document.getElementById('ildaPreviewCard');card.style.display='block';setText('ildaPreviewTitle',path.split('/').pop()+' preview');setText('previewVerdict','Loading animation...');setClass('previewVerdict','previewVerdict muted');setText('previewFrameLabel','Loading');setText('previewFileSize','--');setText('previewFrameCount','--');setText('previewTotalPoints','--');setText('previewMaxFramePoints','--');setText('previewSelectedPoints','--');setText('previewFormats','--');previewFrames=[];previewFrameCount=0;drawIldaPreview([]);if(previewAbort)previewAbort.abort();previewAbort=new AbortController();let url='/api/ilda/preview?path='+encodeURIComponent(path)+'&frame='+requestedFrame+'&all=1';fetch(url,{cache:'no-store',signal:previewAbort.signal}).then(r=>r.text().then(t=>{if(!r.ok)throw new Error(t||'Preview request failed');return JSON.parse(t);})).then(j=>{if(requestId!==previewRequestId)return;if(!Array.isArray(j.frames)||j.frames.length!==j.frame_count)throw new Error('Animated preview data is incomplete');previewFrames=j.frames;previewFrameCount=previewFrames.length;previewLoopReturnSamples=Number(j.loop_return_samples)||0;setText('previewFileSize',fmtBytes(j.file_size));setText('previewFrameCount',j.frame_count.toLocaleString());setText('previewTotalPoints',j.total_points.toLocaleString());setText('previewMaxFramePoints',j.max_frame_points.toLocaleString());let formats=[];[0,1,4,5].forEach(f=>{if(j.format_mask&(1<<f))formats.push('Format '+f);});setText('previewFormats',formats.join(', '));setText('previewVerdict',j.within_sample_limit?'Within the player sample-count limit ('+Number(j.max_samples).toLocaleString()+')':'Exceeds the player sample-count limit ('+Number(j.max_samples).toLocaleString()+')');setClass('previewVerdict','previewVerdict '+(j.within_sample_limit?'ok':'warn'));showPreviewFrame(Math.min(requestedFrame,previewFrameCount-1));if(previewPlaying)schedulePreviewFrame(previewFrame,requestId);}).catch(e=>{if(requestId!==previewRequestId)return;setPreviewPlayback(false);previewFrames=[];previewFrameCount=0;setText('previewFrameLabel','Unavailable');setText('previewVerdict',e.message||'Unable to preview ILDA file');setClass('previewVerdict','previewVerdict err');document.getElementById('previewPrevBtn').disabled=true;document.getElementById('previewNextBtn').disabled=true;document.getElementById('previewPlayBtn').disabled=true;drawIldaPreview([]);});}"
-"function boot(){syncTestColorButtons();loadNetworkSettings();loadProtocolSettings();refreshEngine().finally(()=>{update();});}"
+"function boot(){loadFolderPrefs();syncTestColorButtons();loadNetworkSettings();loadProtocolSettings();refreshEngine().finally(()=>{update();});}"
 "setInterval(update,2000);boot();"
 "</script>"
 "</body></html>";
@@ -1847,6 +1935,7 @@ esp_err_t web_server_start(void)
 
     ESP_ERROR_CHECK(register_handler("/api/ilda/start", HTTP_POST, ilda_start_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/ilda/scale", HTTP_POST, ilda_scale_post_handler));
+    ESP_ERROR_CHECK(register_handler("/api/ilda/play_folder", HTTP_POST, ilda_folder_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/ilda/stop", HTTP_POST, ilda_stop_post_handler));
     ESP_ERROR_CHECK(register_handler("/*", HTTP_GET, captive_portal_get_handler));
 

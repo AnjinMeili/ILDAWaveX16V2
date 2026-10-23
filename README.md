@@ -151,6 +151,7 @@ The **SD playback** page in the web interface can:
 - Preview an `.ild` file before playing it: frame count, point counts, formats, and whether it fits within the player limit
 - Animate the preview at the current DAC point rate, with up to 256 points drawn per frame and up to 1024 frames
 - Scale the projected X/Y size from 10% to 100% around the center, live during playback
+- Play every `.ild` file in a folder, in name order, repeating until stopped. The operator sets how long single-frame files are held (default 5 s), how many times each animation plays (default 1), and whether subfolders are included. Files that fail the checks are skipped, and the output is blanked while the next file loads.
 
 The same features are available through the REST API:
 
@@ -161,9 +162,12 @@ The same features are available through the REST API:
 | `/api/ilda/preview?path=<file>&all=1` | GET | File summary plus every frame, streamed |
 | `/api/ilda/start?path=<file>&scale=<10-100>` | POST | Start playback at the given X/Y scale |
 | `/api/ilda/scale?value=<10-100>` | POST | Change X/Y scale while playing |
+| `/api/ilda/play_folder?path=<folder>&hold=<1-3600>&plays=<1-1000>&recursive=<0/1>&scale=<10-100>` | POST | Play a folder (hold in seconds) |
 | `/api/ilda/stop` | POST | Stop playback |
 
 Previews are served by a background task, so status and stop requests are never delayed by a large preview.
+
+`/api/rp/status` reports the file being played in `ilda_file` (relative to the card root) and whether folder playback is active in `ilda_folder`.
 
 ---
 
