@@ -88,6 +88,8 @@
 #define IDN_LINK_TIMEOUT_US     6000000LL       /* tolerate short sender/UI stalls */
 #define IDN_RATE_HYSTERESIS     100u            /* pps */
 #define IDN_RING_CAPACITY       8192u           /* must be power of 2 */
+#define IDN_FEED_FLUSH_US       100000LL        /* send a partial packet only after the stream idles this long */
+#define IDN_FEED_PREBUFFER      3072u           /* samples queued on the RP before START (~100 ms at 30 kpps) */
 #define IDN_MAX_CHANNELS        64
 #define IDN_MAX_SAMPLE_OCTETS   32
 #define STACK_SERVER            8192u
@@ -525,6 +527,9 @@ static void feed_task(void *arg)
     last.ch[2] = last.ch[3] = last.ch[4] = last.ch[5] = -32768;
 
     bool output_started = false;
+    uint32_t queued_before_start = 0;
+    uint32_t last_avail = 0;
+    int64_t last_growth_us = esp_timer_get_time();
 
     ESP_LOGI(TAG, "IDN feed task started");
 
@@ -534,20 +539,42 @@ static void feed_task(void *arg)
             continue;
         }
 
+        /*
+           Send only full packets while the stream is flowing. Padding a
+           partial packet splices filler into the drawing, and the RP buffer
+           is deep enough to wait for more points. A partial packet is sent
+           only once the stream has gone idle, to flush its tail; an empty
+           ring sends nothing and the RP blanks on underrun.
+        */
         uint32_t avail   = ring_size();
-        uint32_t to_read = avail < (uint32_t)RP_STREAM_SAMPLES_PER_PACKET
-                           ? avail : (uint32_t)RP_STREAM_SAMPLES_PER_PACKET;
+        uint32_t to_read = (uint32_t)RP_STREAM_SAMPLES_PER_PACKET;
 
-        uint32_t got = 0;
-        if (to_read > 0)
-            got = ring_read(s_feed_stage, to_read);
+        if (avail < (uint32_t)RP_STREAM_SAMPLES_PER_PACKET) {
+            int64_t now_us = esp_timer_get_time();
+
+            if (avail != last_avail) {
+                last_avail = avail;
+                last_growth_us = now_us;
+            }
+
+            if (avail == 0 || now_us - last_growth_us < IDN_FEED_FLUSH_US) {
+                vTaskDelay(1);
+                continue;
+            }
+
+            to_read = avail;
+        }
+
+        uint32_t got = ring_read(s_feed_stage, to_read);
+        last_avail = ring_size();
+        last_growth_us = esp_timer_get_time();
 
         for (uint32_t i = 0; i < got; i++) {
             memcpy(s_feed_packet[i], s_feed_stage[i].ch, sizeof(s_feed_packet[i]));
             last = s_feed_stage[i];
         }
 
-        /* Hold scanner position through packet gaps, but never repeat light. */
+        /* Pad a flushed tail by holding position with the laser blanked. */
         for (uint32_t i = got; i < (uint32_t)RP_STREAM_SAMPLES_PER_PACKET; i++) {
             s_feed_packet[i][0] = last.ch[0];
             s_feed_packet[i][1] = last.ch[1];
@@ -558,7 +585,11 @@ static void feed_task(void *arg)
 
         esp_err_t err = rp_manager_send_samples_packet(s_feed_packet);
         if (err == ESP_OK) {
-            if (!output_started) {
+            queued_before_start += got;
+
+            /* Start once a short cushion is queued, or when a short stream is flushed. */
+            if (!output_started &&
+                (queued_before_start >= IDN_FEED_PREBUFFER || got < (uint32_t)RP_STREAM_SAMPLES_PER_PACKET)) {
                 rp_manager_output_start();
                 output_started = true;
                 ESP_LOGI(TAG, "IDN RP output started");

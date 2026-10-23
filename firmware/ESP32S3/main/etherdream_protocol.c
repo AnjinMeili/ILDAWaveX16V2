@@ -62,6 +62,8 @@
 
 /* Ring size in points. Must be a power of 2. */
 #define ED_RING_CAPACITY        8192u
+#define ED_FEED_FLUSH_US        100000LL    /* send a partial packet only after the stream idles this long */
+#define ED_FEED_PREBUFFER       3072u       /* samples queued on the RP before START (~100 ms at 30 kpps) */
 
 /* Maximum point rate we advertise and accept. */
 #define ED_MAX_POINT_RATE       100000u
@@ -311,10 +313,13 @@ static void feed_task(void *arg)
     (void)arg;
     s_feed_running = true;
 
-    /* Last-known point for galvo-hold padding (blanked, at origin) */
+    /* Last-known point for padding a flushed tail */
     ed_point_t last = {0};
 
     bool output_started = false;
+    uint32_t queued_before_start = 0;
+    uint32_t last_avail = 0;
+    int64_t last_growth_us = esp_timer_get_time();
 
     ESP_LOGI(TAG, "Feed task started");
 
@@ -325,14 +330,35 @@ static void feed_task(void *arg)
             continue;
         }
 
+        /*
+           Send only full packets while the stream is flowing. Padding a
+           partial packet splices filler into the drawing, and the RP buffer
+           is deep enough to wait for more points. A partial packet is sent
+           only once the stream has gone idle, to flush its tail; an empty
+           ring sends nothing and the RP blanks on underrun.
+        */
         uint32_t avail   = ring_size();
-        uint32_t to_read = avail < RP_STREAM_SAMPLES_PER_PACKET
-                           ? avail : RP_STREAM_SAMPLES_PER_PACKET;
+        uint32_t to_read = RP_STREAM_SAMPLES_PER_PACKET;
 
-        uint32_t got = 0;
-        if (to_read > 0) {
-            got = ring_read(s_feed_stage, to_read);
+        if (avail < RP_STREAM_SAMPLES_PER_PACKET) {
+            int64_t now_us = esp_timer_get_time();
+
+            if (avail != last_avail) {
+                last_avail = avail;
+                last_growth_us = now_us;
+            }
+
+            if (avail == 0 || now_us - last_growth_us < ED_FEED_FLUSH_US) {
+                vTaskDelay(1);
+                continue;
+            }
+
+            to_read = avail;
         }
+
+        uint32_t got = ring_read(s_feed_stage, to_read);
+        last_avail = ring_size();
+        last_growth_us = esp_timer_get_time();
 
         /* Convert real samples */
         for (uint32_t i = 0; i < got; i++) {
@@ -340,15 +366,21 @@ static void feed_task(void *arg)
             last = s_feed_stage[i];
         }
 
-        /* Pad remainder with galvo-hold (last known point) */
+        /* Pad a flushed tail by holding position with the laser blanked. */
         int16_t pad[RP_SAMPLE_CHANNELS];
         ed_point_to_rp(&last, pad);
+        for (int ch = 2; ch < RP_SAMPLE_CHANNELS; ch++)
+            pad[ch] = -32768;
         for (uint32_t i = got; i < RP_STREAM_SAMPLES_PER_PACKET; i++)
             memcpy(s_feed_packet[i], pad, sizeof(pad));
 
         esp_err_t err = rp_manager_send_samples_packet(s_feed_packet);
         if (err == ESP_OK) {
-            if (!output_started) {
+            queued_before_start += got;
+
+            /* Start once a short cushion is queued, or when a short stream is flushed. */
+            if (!output_started &&
+                (queued_before_start >= ED_FEED_PREBUFFER || got < RP_STREAM_SAMPLES_PER_PACKET)) {
                 rp_manager_output_start();
                 output_started = true;
                 ESP_LOGI(TAG, "RP output started");
