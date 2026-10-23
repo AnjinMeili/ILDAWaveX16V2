@@ -141,7 +141,7 @@ ILDA frames are parsed, converted into X/Y/color/intensity samples, and streamed
 
 The current implementation loads converted frames into PSRAM-backed memory, which makes playback fast and stable, but limits the maximum file size that can be played. The current limit is 89,600 points in total across all frames.
 
-Before loading, the player scans the whole file to count its points. Files that exceed the limit, use an unsupported format, or are truncated are rejected before any memory is allocated. Supported formats are 0, 1, 4 and 5.
+Before loading, the player scans the whole file to count its points. Files that exceed the limit, use an unsupported format, or are truncated are rejected before the current playback is stopped, so a bad file never interrupts output. Supported formats are 0, 1, 4 and 5. Some exporters write the closing header with the last frame's point count instead of zero; a header with no data after it is accepted as the end of the file.
 
 A future improvement would be continuous batch reading, where only partial chunks of the ILDA file are read, converted, and streamed at a time. This would allow larger files to be played without loading the full converted output into memory.
 

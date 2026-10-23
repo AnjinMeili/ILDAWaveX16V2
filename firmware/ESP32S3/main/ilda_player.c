@@ -181,31 +181,44 @@ size_t ilda_player_max_samples(void)
     return PSRAM_LIMIT_BYTES / sizeof(sample_t);
 }
 
-static esp_err_t preflight_ilda(FILE *f, size_t *sample_count)
+static esp_err_t check_ilda_file(const char *path, size_t *sample_count)
 {
+    /*
+       Validate the whole file before playback state is touched, so a bad
+       file is rejected while the current output keeps running.
+    */
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        ESP_LOGE(TAG, "Failed to open %s", path);
+        return ESP_FAIL;
+    }
+
     uint8_t discard[256];
     size_t total_samples = 0;
     size_t max_samples = ilda_player_max_samples();
+    long offset = 0;
+    esp_err_t ret = ESP_OK;
 
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-
-    while (!s_stop) {
+    while (true) {
         uint8_t header[32];
         size_t header_bytes = fread(header, 1, sizeof(header), f);
+
         if (header_bytes != sizeof(header)) {
             if (ferror(f)) {
-                return ESP_FAIL;
-            }
-            if (header_bytes != 0) {
-                return ESP_ERR_INVALID_SIZE;
+                ESP_LOGE(TAG, "Read error at offset %ld", offset);
+                ret = ESP_FAIL;
+            } else if (header_bytes != 0) {
+                /* The loader has always treated a short tail as end of file. */
+                ESP_LOGW(TAG, "Ignoring %u trailing bytes at offset %ld",
+                         (unsigned int)header_bytes, offset);
             }
             break;
         }
 
         if (memcmp(header, "ILDA", 4) != 0) {
-            return ESP_ERR_INVALID_RESPONSE;
+            ESP_LOGE(TAG, "Bad ILDA header at offset %ld", offset);
+            ret = ESP_ERR_INVALID_RESPONSE;
+            break;
         }
 
         uint8_t format = header[7];
@@ -216,42 +229,69 @@ static esp_err_t preflight_ilda(FILE *f, size_t *sample_count)
 
         int rec_size = ilda_record_size_for_format(format);
         if (rec_size <= 0) {
-            return ESP_ERR_NOT_SUPPORTED;
+            ESP_LOGE(TAG, "Unsupported ILDA format %u at offset %ld", format, offset);
+            ret = ESP_ERR_NOT_SUPPORTED;
+            break;
+        }
+
+        offset += (long)sizeof(header);
+
+        size_t payload = (size_t)records * (size_t)rec_size;
+        size_t remaining = payload;
+        while (remaining > 0) {
+            size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+            size_t got = fread(discard, 1, chunk, f);
+            remaining -= got;
+            if (got != chunk) {
+                break;
+            }
+        }
+
+        if (remaining == payload && feof(f)) {
+            /*
+               Some exporters write the closing header with the last frame's
+               point count instead of zero. A header with nothing after it
+               can only be the end-of-file marker.
+            */
+            ESP_LOGW(TAG, "Header at offset %ld has no point data, treating it as end of file",
+                     offset - (long)sizeof(header));
+            break;
+        }
+
+        if (remaining > 0) {
+            ESP_LOGE(TAG, "Frame at offset %ld is truncated: %u of %u point bytes missing",
+                     offset - (long)sizeof(header), (unsigned int)remaining,
+                     (unsigned int)payload);
+            ret = ESP_ERR_INVALID_SIZE;
+            break;
         }
 
         if ((size_t)records > max_samples - total_samples) {
             ESP_LOGE(TAG, "ILDA exceeds memory limit of %u samples", (unsigned int)max_samples);
-            return ESP_ERR_NO_MEM;
+            ret = ESP_ERR_NO_MEM;
+            break;
         }
 
         total_samples += records;
-        size_t remaining = (size_t)records * (size_t)rec_size;
-        while (remaining > 0) {
-            size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
-            if (fread(discard, 1, chunk, f) != chunk) {
-                return ESP_ERR_INVALID_SIZE;
-            }
-            remaining -= chunk;
-        }
-
+        offset += (long)payload;
         taskYIELD();
     }
 
-    if (s_stop) {
-        return ESP_ERR_INVALID_STATE;
-    }
-    if (total_samples == 0) {
-        return ESP_ERR_INVALID_SIZE;
-    }
-    if (fseek(f, 0, SEEK_SET) != 0) {
-        return ESP_ERR_INVALID_SIZE;
+    fclose(f);
+
+    if (ret == ESP_OK && total_samples == 0) {
+        ESP_LOGE(TAG, "ILDA file contains no points");
+        ret = ESP_ERR_INVALID_SIZE;
     }
 
-    *sample_count = total_samples;
-    return ESP_OK;
+    if (ret == ESP_OK) {
+        *sample_count = total_samples;
+    }
+
+    return ret;
 }
 
-static esp_err_t load_ilda_to_psram(const char *path)
+static esp_err_t load_ilda_to_psram(const char *path, size_t expected_samples)
 {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -260,14 +300,6 @@ static esp_err_t load_ilda_to_psram(const char *path)
     }
 
     free_samples();
-
-    size_t expected_samples = 0;
-    esp_err_t ret = preflight_ilda(f, &expected_samples);
-    if (ret != ESP_OK) {
-        fclose(f);
-        ESP_LOGE(TAG, "ILDA preflight failed: %s", esp_err_to_name(ret));
-        return ret;
-    }
 
     s_samples = heap_caps_malloc(expected_samples * sizeof(sample_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_samples) {
@@ -282,7 +314,7 @@ static esp_err_t load_ilda_to_psram(const char *path)
 
     size_t count = 0;
 
-    while (!s_stop) {
+    while (!s_stop && count < expected_samples) {
         uint8_t header[32];
 
         if (fread(header, 1, sizeof(header), f) != sizeof(header)) {
@@ -535,7 +567,14 @@ esp_err_t ilda_player_start(const char *path, uint8_t scale_percent)
         return ESP_ERR_INVALID_ARG;
     }
 
-    esp_err_t ret = ilda_player_stop_and_wait(5000);
+    size_t expected_samples = 0;
+    esp_err_t ret = check_ilda_file(path, &expected_samples);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ILDA check failed for %s: %s", path, esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = ilda_player_stop_and_wait(5000);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -556,7 +595,7 @@ esp_err_t ilda_player_start(const char *path, uint8_t scale_percent)
     ESP_LOGI(TAG, "Starting ILDA memory playback: %s at %u%% XY scale",
              path, (unsigned int)scale_percent);
 
-    ret = load_ilda_to_psram(path);
+    ret = load_ilda_to_psram(path, expected_samples);
     if (ret != ESP_OK) {
         s_stop = true;
         free_samples();

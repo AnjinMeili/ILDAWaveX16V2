@@ -191,18 +191,24 @@ esp_err_t ilda_preview_analyze(const char *path, uint32_t selected_frame,
         uint8_t header[ILDA_HEADER_BYTES];
         size_t header_bytes = fread(header, 1, sizeof(header), file);
 
-        if (header_bytes == 0 && feof(file)) {
-            break;
-        }
-
         if (header_bytes != sizeof(header)) {
-            ret = ferror(file) ? ESP_FAIL : ESP_ERR_INVALID_SIZE;
+            if (ferror(file)) {
+                ESP_LOGW(TAG, "%s: read error at offset %llu", path,
+                         (unsigned long long)file_offset);
+                ret = ESP_FAIL;
+            } else if (header_bytes != 0) {
+                /* Matches the player: a short tail is treated as end of file. */
+                ESP_LOGW(TAG, "%s: ignoring %u trailing bytes at offset %llu", path,
+                         (unsigned)header_bytes, (unsigned long long)file_offset);
+            }
             break;
         }
 
         file_offset += sizeof(header);
 
         if (memcmp(header, "ILDA", 4) != 0) {
+            ESP_LOGW(TAG, "%s: bad ILDA header at offset %llu", path,
+                     (unsigned long long)(file_offset - sizeof(header)));
             ret = ESP_ERR_INVALID_RESPONSE;
             break;
         }
@@ -213,8 +219,19 @@ esp_err_t ilda_preview_analyze(const char *path, uint32_t selected_frame,
             break;
         }
 
+        if (file_offset == file_size) {
+            /*
+               Some exporters write the closing header with the last frame's
+               point count instead of zero. A header with nothing after it
+               can only be the end-of-file marker.
+            */
+            break;
+        }
+
         int record_size = ilda_record_size_for_format(format);
         if (record_size < 0) {
+            ESP_LOGW(TAG, "%s: unsupported format %u at offset %llu", path, format,
+                     (unsigned long long)(file_offset - sizeof(header)));
             ret = ESP_ERR_NOT_SUPPORTED;
             break;
         }
@@ -236,6 +253,10 @@ esp_err_t ilda_preview_analyze(const char *path, uint32_t selected_frame,
 
         uint64_t payload_bytes = (uint64_t)record_count * (uint64_t)record_size;
         if (file_offset > file_size || payload_bytes > file_size - file_offset) {
+            ESP_LOGW(TAG, "%s: frame at offset %llu needs %llu point bytes, file has %llu",
+                     path, (unsigned long long)(file_offset - sizeof(header)),
+                     (unsigned long long)payload_bytes,
+                     (unsigned long long)(file_size - file_offset));
             ret = ESP_ERR_INVALID_SIZE;
             break;
         }
