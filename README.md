@@ -181,7 +181,9 @@ Once connected, incoming IDN real-time stream data is parsed, converted into the
 
 If the stream pauses between packets, the scanners hold their last position with all color and intensity channels blanked, so the last colored point is never repeated.
 
-This protocol path works, but still needs optimization at higher point rates.
+IDN has no flow control: the sender streams at its own pace. The board queues 3,072 points (about 100 ms at 30 kpps) on the RP2354 before output starts, and that queue absorbs gaps in the sender's stream. A gap longer than the queue shows up as blanking. `IDN_FEED_PREBUFFER` in `ESP32S3/main/idn_protocol.c` trades latency against tolerance for sender hiccups.
+
+Tested with Modulaser at 30 kpps over wired Ethernet: no dropped packets, and output keeps pace with the stream.
 
 ---
 
@@ -194,11 +196,15 @@ Implemented features include:
 - UDP discovery
 - TCP control
 - TCP streaming
-- Point-rate configuration
+- Point-rate configuration, including rate changes during playback (`u`)
 - Prepare / start / stop behavior
 - Ether Dream point conversion into the internal 8-channel sample format
 
-This protocol path works, but still needs optimization at higher point rates.
+The client paces itself from the buffer fullness the board reports. The board keeps only a short cushion (3,072 points) on the RP2354 and holds the rest in its 8,192-point Ether Dream buffer, so the reported fullness covers everything not yet played.
+
+How much is queued is the client's choice. If output blanks briefly while the client is busy, raise the client's buffer or latency setting for the DAC.
+
+Tested with Modulaser over wired Ethernet: about 21,700 points/s get through at 22 kpps and about 29,500 at 30 kpps.
 
 ---
 
