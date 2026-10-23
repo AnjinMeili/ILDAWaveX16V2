@@ -60,8 +60,10 @@
 
 /* -- Tunables --------------------------------------------------------------- */
 
-/* Ring size in points. Must be a power of 2. */
+/* Ring size in points. Must be a power of 2. One slot stays empty, so
+ * clients are told ED_BUFFER_CAPACITY. */
 #define ED_RING_CAPACITY        8192u
+#define ED_BUFFER_CAPACITY      (ED_RING_CAPACITY - 1u)
 #define ED_FEED_FLUSH_US        100000LL    /* send a partial packet only after the stream idles this long */
 #define ED_FEED_PREBUFFER       3072u       /* samples queued on the RP before START (~100 ms at 30 kpps) */
 #define ED_RP_CUSHION           ED_FEED_PREBUFFER /* samples kept queued on the RP while playing */
@@ -288,11 +290,11 @@ static ed_dac_status_t make_status(void)
     s.playback_flags     = s_pb_flags;
     /*
        Report everything not yet played, including the RP's cushion, so the
-       client paces against the real queue. Capped below capacity so the free
+       client paces against the real queue. Capped at capacity so the free
        space a client computes never exceeds what the ring can take.
     */
     uint32_t fill        = ring_size() + s_rp_queued;
-    if (fill > ED_RING_CAPACITY - 1u) fill = ED_RING_CAPACITY - 1u;
+    if (fill > ED_BUFFER_CAPACITY) fill = ED_BUFFER_CAPACITY;
     s.buffer_fullness    = (uint16_t)fill;
     s.point_rate         = (s_pb_state == PB_IDLE) ? 0 : s_point_rate;
     s.point_count        = s_point_count;
@@ -1030,7 +1032,7 @@ static void broadcast_task(void *arg)
         memcpy(pkt.mac_address, s_mac, 6);
         pkt.hw_revision    = 0x0002;
         pkt.sw_revision    = 0x0002;
-        pkt.buffer_capacity = (uint16_t)ED_RING_CAPACITY;
+        pkt.buffer_capacity = (uint16_t)ED_BUFFER_CAPACITY;
         pkt.max_point_rate  = ED_MAX_POINT_RATE;
         pkt.status          = make_status();
 
@@ -1050,7 +1052,7 @@ static void broadcast_task(void *arg)
             memcpy(reply.mac_address, s_mac, 6);
             reply.hw_revision    = 0x0002;
             reply.sw_revision    = 0x0002;
-            reply.buffer_capacity = (uint16_t)ED_RING_CAPACITY;
+            reply.buffer_capacity = (uint16_t)ED_BUFFER_CAPACITY;
             reply.max_point_rate  = ED_MAX_POINT_RATE;
             reply.status          = make_status();
             sendto(sock, &reply, sizeof(reply), 0,
