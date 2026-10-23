@@ -4,10 +4,12 @@
 #include "pico/flash.h"
 #include "pico/multicore.h"
 #include "pico/sync.h"
+#include "hardware/gpio.h"
 
 #include "ring_buffer.h"
 #include "dac80508.h"
 #include "output_engine.h"
+#include "project_config.h"
 
 #define OUTPUT_DEFAULT_SAMPLE_RATE_HZ 30000
 
@@ -24,6 +26,9 @@ static volatile bool s_mirror_y = true;
 
 static volatile uint32_t s_consumed_samples = 0;
 static volatile uint32_t s_underruns = 0;
+static volatile uint32_t s_failsafe_blank_events = 0;
+static volatile uint32_t s_mode_transitions = 0;
+static volatile output_engine_mode_t s_output_mode = OUTPUT_MODE_HARD_ZERO;
 
 static int16_t s_last_output[RP_SAMPLE_CHANNELS];
 
@@ -39,6 +44,57 @@ static volatile bool s_core1_launched = false;
 static bool s_have_valid_xy = false;
 static int16_t s_last_valid_x = 0;
 static int16_t s_last_valid_y = 0;
+
+static void trace_pins_init(void)
+{
+    /*
+       Scope trace outputs on the RP_IO10/RP_IO11 breakout nets.
+       OUTPUT_RUNNING is high while START is active.
+       FORCED_BLANK is high whenever the DAC is not playing stream samples.
+    */
+    gpio_init(PIN_TRACE_OUTPUT_RUNNING);
+    gpio_set_dir(PIN_TRACE_OUTPUT_RUNNING, GPIO_OUT);
+    gpio_put(PIN_TRACE_OUTPUT_RUNNING, false);
+
+    gpio_init(PIN_TRACE_FORCED_BLANK);
+    gpio_set_dir(PIN_TRACE_FORCED_BLANK, GPIO_OUT);
+    gpio_put(PIN_TRACE_FORCED_BLANK, true);
+}
+
+static void set_trace_running(bool running)
+{
+    gpio_put(PIN_TRACE_OUTPUT_RUNNING, running);
+}
+
+static void set_output_mode(output_engine_mode_t mode)
+{
+    bool changed = false;
+
+    critical_section_enter_blocking(&s_output_cs);
+
+    if (s_output_mode != mode) {
+        s_output_mode = mode;
+        s_mode_transitions++;
+        changed = true;
+    }
+
+    critical_section_exit(&s_output_cs);
+
+    if (changed) {
+        gpio_put(PIN_TRACE_FORCED_BLANK, mode != OUTPUT_MODE_STREAMING);
+    }
+}
+
+static void note_output_starved(void)
+{
+    /*
+       START_BLANK and FAILSAFE_BLANK persist until real samples arrive.
+       Only a running stream drops into UNDERRUN_BLANK.
+    */
+    if (s_output_mode == OUTPUT_MODE_STREAMING) {
+        set_output_mode(OUTPUT_MODE_UNDERRUN_BLANK);
+    }
+}
 
 static void sample_hard_zero(int16_t sample[RP_SAMPLE_CHANNELS])
 {
@@ -155,6 +211,12 @@ static void force_dac_blanked_hold_xy_now(void)
 
     get_hold_xy(&x, &y);
 
+    set_output_mode(OUTPUT_MODE_FAILSAFE_BLANK);
+
+    critical_section_enter_blocking(&s_output_cs);
+    s_failsafe_blank_events++;
+    critical_section_exit(&s_output_cs);
+
     set_last_output_blanked_hold_xy();
     dac_write_blanked_xy_mirrored(x, y);
 
@@ -206,6 +268,7 @@ static void output_one_sample_timed(absolute_time_t *next_time)
     }
 
     if (ring_pop(sample)) {
+        set_output_mode(OUTPUT_MODE_STREAMING);
         note_valid_sample(sample);
         apply_output_mirror(sample);
 
@@ -222,6 +285,7 @@ static void output_one_sample_timed(absolute_time_t *next_time)
     } else {
         int16_t blanked[RP_SAMPLE_CHANNELS];
 
+        note_output_starved();
         sample_blanked_hold_xy(blanked);
         apply_output_mirror(blanked);
 
@@ -265,6 +329,14 @@ static void output_batch(void)
     uint32_t missing = OUTPUT_BATCH_SAMPLES - got;
 
     if (s_running) {
+        if (got == 0) {
+            note_output_starved();
+        } else {
+            set_output_mode(missing > 0 ? OUTPUT_MODE_UNDERRUN_BLANK : OUTPUT_MODE_STREAMING);
+        }
+    }
+
+    if (s_running) {
         critical_section_enter_blocking(&s_output_cs);
         s_consumed_samples += got;
         s_underruns += missing;
@@ -292,6 +364,8 @@ static void output_batch(void)
 static void stop_stream_state(void)
 {
     s_running = false;
+    set_trace_running(false);
+    set_output_mode(OUTPUT_MODE_HARD_ZERO);
 
     ring_clear();
     set_last_output_hard_zero();
@@ -338,6 +412,7 @@ static void launch_output_core(void)
 void output_engine_init(void)
 {
     critical_section_init(&s_output_cs);
+    trace_pins_init();
 
     set_last_output_hard_zero();
 
@@ -377,7 +452,11 @@ void output_engine_start(void)
 
     dac_write_blanked_xy(0, 0);
 
+    set_output_mode(OUTPUT_MODE_START_BLANK);
+    set_last_output_blanked_hold_xy();
+
     s_running = true;
+    set_trace_running(true);
 }
 
 void output_engine_stop_safe(void)
@@ -449,6 +528,9 @@ void output_engine_get_status(output_engine_status_t *status)
     status->sample_rate_hz = s_sample_rate_hz;
     status->consumed_samples = s_consumed_samples;
     status->underruns = s_underruns;
+    status->failsafe_blank_events = s_failsafe_blank_events;
+    status->mode_transitions = s_mode_transitions;
+    status->mode = s_output_mode;
     status->mirror_x = s_mirror_x;
     status->mirror_y = s_mirror_y;
 

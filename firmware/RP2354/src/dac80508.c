@@ -11,17 +11,14 @@
 #include "dac80508_tx.pio.h"
 
 #include "dac80508.h"
+#include "project_config.h"
 
 /* DAC80508 pins */
-#define DAC_MISO_GPIO 0
-#define DAC_CS_GPIO   1
-#define DAC_SCK_GPIO  2
-#define DAC_MOSI_GPIO 3
-
-#define DAC_REG_SYNC     0x02
-#define DAC_REG_GAIN     0x04
-#define DAC_REG_TRIGGER  0x05
-#define DAC_REG_DAC_BASE 0x08
+#define DAC_MISO_GPIO PIN_DAC_MISO
+#define DAC_CS_GPIO   PIN_DAC_CS
+#define DAC_SCK_GPIO  PIN_DAC_SCK
+#define DAC_MOSI_GPIO PIN_DAC_MOSI
+#define DAC_REG_DAC_BASE DAC_REG_DAC0
 
 #define DAC_CH_X  6
 #define DAC_CH_Y  7
@@ -43,6 +40,7 @@ static critical_section_t s_dac_cs;
 
 static uint8_t s_active_mask = DAC_DEFAULT_ACTIVE_MASK;
 static uint32_t s_sample_rate_hz = 1000;
+static volatile uint32_t s_dma_words_submitted = 0;
 
 static inline uint16_t signed_to_dac(int16_t v)
 {
@@ -220,6 +218,7 @@ static void dac_pio_dma_write_words_blocking(const uint32_t *words, uint32_t cou
     );
 
     dma_channel_wait_for_finish_blocking(s_dac_dma_chan);
+    s_dma_words_submitted += count;
 
     critical_section_exit(&s_dac_cs);
 }
@@ -265,6 +264,15 @@ void dac_set_active_mask(uint8_t mask)
 uint8_t dac_get_active_mask(void)
 {
     return s_active_mask;
+}
+
+uint32_t dac_get_dma_words_submitted(void)
+{
+    /*
+       Lock-free read: s_dac_cs is held across DMA completion on core1,
+       and an aligned 32-bit load is atomic on Cortex-M33.
+    */
+    return s_dma_words_submitted;
 }
 
 void dac_write_all_zero(void)
