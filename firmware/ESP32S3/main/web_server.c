@@ -8,6 +8,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 #include "esp_log.h"
 #include "esp_err.h"
@@ -19,6 +20,7 @@
 #include "net_manager.h"
 #include "rp_manager.h"
 #include "ilda_player.h"
+#include "ilda_preview.h"
 #include "sd_manager.h"
 #include "protocol_stream_stats.h"
 #include "protocol_settings.h"
@@ -30,14 +32,17 @@ static const char *TAG = "web";
 
 static httpd_handle_t s_server = NULL;
 static TaskHandle_t s_refresh_task = NULL;
+static QueueHandle_t s_preview_queue = NULL;
 
 #define WEB_SERVER_TASK_STACK_BYTES 16384
-#define WEB_SD_LIST_JSON_BYTES 2048
 #define WEB_SD_PATH_MAX 191
 #define WEB_SD_REL_PATH_MAX (WEB_SD_PATH_MAX - sizeof(SD_MOUNT_POINT))
 #define WEB_RP_STATUS_JSON_BYTES 1920
 #define WEB_NETWORK_JSON_BYTES 2048
 #define WEB_PROTOCOL_JSON_BYTES 960
+#define WEB_JSON_CHUNK_BYTES 768
+#define WEB_PREVIEW_TASK_STACK_BYTES WEB_SERVER_TASK_STACK_BYTES
+#define WEB_PREVIEW_QUEUE_LENGTH 2
 
 /* ===================== BACKGROUND DAC ENGINE REFRESH ===================== */
 
@@ -236,6 +241,65 @@ static esp_err_t read_request_body(httpd_req_t *req, char *body, size_t body_len
     return ESP_OK;
 }
 
+/* ===================== CHUNKED JSON ===================== */
+
+typedef struct {
+    httpd_req_t *req;
+    char chunk[WEB_JSON_CHUNK_BYTES];
+    size_t chunk_len;
+} json_chunk_stream_t;
+
+static esp_err_t json_stream_append(json_chunk_stream_t *stream,
+                                    const char *data, size_t data_len)
+{
+    while (data_len > 0) {
+        if (stream->chunk_len == sizeof(stream->chunk)) {
+            esp_err_t ret = httpd_resp_send_chunk(stream->req, stream->chunk,
+                                                  stream->chunk_len);
+            if (ret != ESP_OK) {
+                return ret;
+            }
+
+            stream->chunk_len = 0;
+        }
+
+        size_t available = sizeof(stream->chunk) - stream->chunk_len;
+        size_t copy_len = data_len < available ? data_len : available;
+
+        memcpy(stream->chunk + stream->chunk_len, data, copy_len);
+        stream->chunk_len += copy_len;
+        data += copy_len;
+        data_len -= copy_len;
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t json_stream_append_formatted(json_chunk_stream_t *stream,
+                                              char *buf, size_t buf_len, int len)
+{
+    if (len < 0 || (size_t)len >= buf_len) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    return json_stream_append(stream, buf, (size_t)len);
+}
+
+static esp_err_t json_stream_finish(json_chunk_stream_t *stream)
+{
+    if (stream->chunk_len > 0) {
+        esp_err_t ret = httpd_resp_send_chunk(stream->req, stream->chunk,
+                                              stream->chunk_len);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+
+        stream->chunk_len = 0;
+    }
+
+    return httpd_resp_send_chunk(stream->req, NULL, 0);
+}
+
 /* ===================== SD LIST ===================== */
 
 static bool valid_sd_relative_path(const char *path)
@@ -250,22 +314,27 @@ static bool valid_sd_relative_path(const char *path)
     }
 
     const char *segment = path;
+
     for (const char *cursor = path;; cursor++) {
         unsigned char ch = (unsigned char)*cursor;
-        if (ch == '\\' || ch < 0x20) {
+
+        if (ch == '\\' || (ch != '\0' && ch < 0x20)) {
             return false;
         }
 
         if (ch == '/' || ch == '\0') {
             size_t segment_len = (size_t)(cursor - segment);
+
             if (segment_len == 0 ||
                 (segment_len == 1 && segment[0] == '.') ||
                 (segment_len == 2 && segment[0] == '.' && segment[1] == '.')) {
                 return false;
             }
+
             if (ch == '\0') {
                 break;
             }
+
             segment = cursor + 1;
         }
     }
@@ -283,29 +352,23 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
     char query[WEB_SD_REL_PATH_MAX * 3 + 16] = {0};
     char encoded_path[WEB_SD_REL_PATH_MAX * 3 + 1] = {0};
     char current_path[WEB_SD_REL_PATH_MAX + 1] = {0};
+
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
         esp_err_t query_ret = httpd_query_key_value(query, "path", encoded_path, sizeof(encoded_path));
+
         if (query_ret == ESP_OK) {
             url_decode_inplace(encoded_path);
             if (!valid_sd_relative_path(encoded_path)) {
                 return send_bad_request(req, "Invalid SD directory path");
             }
+
             strlcpy(current_path, encoded_path, sizeof(current_path));
         } else if (strstr(query, "path=") != NULL) {
             return send_bad_request(req, "SD directory path is too long");
         }
     }
 
-    char *json = malloc(WEB_SD_LIST_JSON_BYTES);
-    if (!json) {
-        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
-    }
-
-    size_t off = 0;
-    int count = 0;
-
     if (!sd.mounted) {
-        free(json);
         set_common_response_headers(req);
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"mounted\":false,\"current\":\"\",\"count\":0,\"files\":[]}");
@@ -315,14 +378,13 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
     int directory_path_len = current_path[0]
         ? snprintf(directory_path, sizeof(directory_path), "%s/%s", SD_MOUNT_POINT, current_path)
         : snprintf(directory_path, sizeof(directory_path), "%s", SD_MOUNT_POINT);
-    if (directory_path_len < 0 || directory_path_len >= sizeof(directory_path)) {
-        free(json);
+
+    if (directory_path_len < 0 || (size_t)directory_path_len >= sizeof(directory_path)) {
         return send_bad_request(req, "SD directory path is too long");
     }
 
     struct stat directory_stat;
     if (stat(directory_path, &directory_stat) != 0 || !S_ISDIR(directory_stat.st_mode)) {
-        free(json);
         set_common_response_headers(req);
         httpd_resp_set_status(req, "404 Not Found");
         httpd_resp_set_type(req, "application/json");
@@ -332,28 +394,46 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
     DIR *dir = opendir(directory_path);
 
     if (!dir) {
-        free(json);
         set_common_response_headers(req);
         httpd_resp_set_type(req, "application/json");
         return httpd_resp_sendstr(req, "{\"mounted\":false,\"current\":\"\",\"count\":0,\"files\":[]}");
     }
 
+    json_chunk_stream_t *stream = malloc(sizeof(*stream));
+    if (!stream) {
+        closedir(dir);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
+    }
+
+    stream->req = req;
+    stream->chunk_len = 0;
+
+    set_common_response_headers(req);
+    httpd_resp_set_type(req, "application/json");
+
+    /*
+       Stream entries in chunks so large directories are listed in full
+       instead of being cut off at a fixed response buffer size.
+    */
+    char item[1200];
     char escaped_current[WEB_SD_REL_PATH_MAX * 2 + 1];
     json_escape(current_path, escaped_current, sizeof(escaped_current));
-    off += snprintf(json + off, WEB_SD_LIST_JSON_BYTES - off,
-                    "{\"mounted\":true,\"current\":\"%s\",\"files\":[",
-                    escaped_current);
 
+    esp_err_t ret = json_stream_append_formatted(stream, item, sizeof(item),
+        snprintf(item, sizeof(item), "{\"mounted\":true,\"current\":\"%s\",\"files\":[",
+                 escaped_current));
+
+    int count = 0;
     struct dirent *ent;
 
-    while ((ent = readdir(dir)) != NULL) {
+    while (ret == ESP_OK && (ent = readdir(dir)) != NULL) {
         if (ent->d_name[0] == '.') {
             continue;
         }
 
         char path[WEB_SD_PATH_MAX + 1];
         int path_len = snprintf(path, sizeof(path), "%s/%s", directory_path, ent->d_name);
-        if (path_len < 0 || path_len >= sizeof(path)) {
+        if (path_len < 0 || (size_t)path_len >= sizeof(path)) {
             continue;
         }
 
@@ -361,7 +441,7 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
         int browse_path_len = current_path[0]
             ? snprintf(browse_path, sizeof(browse_path), "%s/%s", current_path, ent->d_name)
             : snprintf(browse_path, sizeof(browse_path), "%s", ent->d_name);
-        if (browse_path_len < 0 || browse_path_len >= sizeof(browse_path)) {
+        if (browse_path_len < 0 || (size_t)browse_path_len >= sizeof(browse_path)) {
             continue;
         }
 
@@ -386,60 +466,267 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
             }
         }
 
-        if (count > 0) {
-            if (off + 1 >= WEB_SD_LIST_JSON_BYTES) {
-                break;
-            }
-            json[off++] = ',';
-            json[off] = '\0';
-        }
-
         char escaped_name[512];
         char escaped_path[WEB_SD_PATH_MAX * 2 + 1];
         char escaped_browse_path[WEB_SD_REL_PATH_MAX * 2 + 1];
-        char escaped_type[512];
-        char item[1200];
+        char escaped_type[64];
+
         json_escape(ent->d_name, escaped_name, sizeof(escaped_name));
         json_escape(path, escaped_path, sizeof(escaped_path));
         json_escape(browse_path, escaped_browse_path, sizeof(escaped_browse_path));
         json_escape(type, escaped_type, sizeof(escaped_type));
+
         int item_len = snprintf(item, sizeof(item),
-                                "{\"name\":\"%s\",\"path\":\"%s\",\"browse_path\":\"%s\",\"size\":%lu,\"type\":\"%s\",\"is_dir\":%s}",
+                                "%s{\"name\":\"%s\",\"path\":\"%s\",\"browse_path\":\"%s\",\"size\":%lu,\"type\":\"%s\",\"is_dir\":%s}",
+                                count > 0 ? "," : "",
                                 escaped_name, escaped_path, escaped_browse_path,
                                 (unsigned long)st.st_size, escaped_type,
                                 is_dir ? "true" : "false");
-        if (item_len < 0 || item_len >= sizeof(item) ||
-            off + (size_t)item_len + 64 >= WEB_SD_LIST_JSON_BYTES) {
-            if (count > 0) {
-                off--;
-                json[off] = '\0';
-            }
-            break;
+        if (item_len < 0 || (size_t)item_len >= sizeof(item)) {
+            continue;
         }
-        memcpy(json + off, item, (size_t)item_len);
-        off += (size_t)item_len;
-        json[off] = '\0';
 
+        ret = json_stream_append(stream, item, (size_t)item_len);
         count++;
-
-        if (count >= 48) {
-            break;
-        }
-
-        if (off > WEB_SD_LIST_JSON_BYTES - 256) {
-            break;
-        }
     }
 
     closedir(dir);
 
-    off += snprintf(json + off, WEB_SD_LIST_JSON_BYTES - off, "],\"count\":%d}", count);
+    if (ret == ESP_OK) {
+        ret = json_stream_append_formatted(stream, item, sizeof(item),
+            snprintf(item, sizeof(item), "],\"count\":%d}", count));
+    }
+
+    if (ret == ESP_OK) {
+        ret = json_stream_finish(stream);
+    }
+
+    free(stream);
+    return ret;
+}
+
+/* ===================== ILDA PREVIEW ===================== */
+
+static esp_err_t preview_stream_points(json_chunk_stream_t *stream,
+                                       const ilda_preview_point_t *points,
+                                       uint32_t point_count)
+{
+    for (uint32_t i = 0; i < point_count; i++) {
+        const ilda_preview_point_t *point = &points[i];
+        char item[64];
+
+        esp_err_t ret = json_stream_append_formatted(stream, item, sizeof(item),
+            snprintf(item, sizeof(item), "%s[%d,%d,%u,%u,%u,%u]",
+                     i == 0 ? "" : ",", point->x, point->y,
+                     point->r, point->g, point->b,
+                     point->blanked ? 1U : 0U));
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    return ESP_OK;
+}
+
+static esp_err_t preview_frame_stream_cb(void *context, uint32_t frame_index,
+                                         uint16_t frame_points,
+                                         const ilda_preview_point_t *points,
+                                         uint32_t point_count)
+{
+    json_chunk_stream_t *stream = context;
+    char header[48];
+
+    esp_err_t ret = json_stream_append_formatted(stream, header, sizeof(header),
+        snprintf(header, sizeof(header), "%s{\"point_count\":%u,\"points\":[",
+                 frame_index > 0 ? "," : "", (unsigned)frame_points));
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = preview_stream_points(stream, points, point_count);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    return json_stream_append(stream, "]}", 2);
+}
+
+static esp_err_t ilda_preview_send(httpd_req_t *req)
+{
+    char query[WEB_SD_REL_PATH_MAX * 3 + 32] = {0};
+    char encoded_path[WEB_SD_REL_PATH_MAX * 3 + 1] = {0};
+    char relative_path[WEB_SD_REL_PATH_MAX + 1] = {0};
+    char frame_value[16] = {0};
+    char all_frames_value[8] = {0};
+    char full_path[WEB_SD_PATH_MAX + 1];
+    uint32_t selected_frame = 0;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "path", encoded_path, sizeof(encoded_path)) != ESP_OK) {
+        return send_bad_request(req, "An ILDA file path is required");
+    }
+
+    bool all_frames = httpd_query_key_value(query, "all", all_frames_value,
+                                            sizeof(all_frames_value)) == ESP_OK &&
+                      strcmp(all_frames_value, "1") == 0;
+
+    url_decode_inplace(encoded_path);
+    if (!encoded_path[0] || !valid_sd_relative_path(encoded_path)) {
+        return send_bad_request(req, "Invalid SD file path");
+    }
+
+    strlcpy(relative_path, encoded_path, sizeof(relative_path));
+
+    const char *extension = strrchr(relative_path, '.');
+    if (!extension || strcasecmp(extension, ".ild") != 0) {
+        return send_bad_request(req, "Only ILDA files can be previewed");
+    }
+
+    if (httpd_query_key_value(query, "frame", frame_value, sizeof(frame_value)) == ESP_OK) {
+        char *end = NULL;
+        unsigned long parsed = strtoul(frame_value, &end, 10);
+
+        if (frame_value[0] == '\0' || !end || *end != '\0' || parsed > UINT32_MAX) {
+            return send_bad_request(req, "Invalid frame index");
+        }
+
+        selected_frame = (uint32_t)parsed;
+    }
+
+    sd_status_t sd = {0};
+    sd_manager_get_status(&sd);
+    if (!sd.mounted) {
+        return send_bad_request(req, "SD card is not mounted");
+    }
+
+    int path_len = snprintf(full_path, sizeof(full_path), "%s/%s", SD_MOUNT_POINT, relative_path);
+    if (path_len < 0 || (size_t)path_len >= sizeof(full_path)) {
+        return send_bad_request(req, "SD file path is too long");
+    }
+
+    struct stat file_stat;
+    if (stat(full_path, &file_stat) != 0 || !S_ISREG(file_stat.st_mode)) {
+        return send_bad_request(req, "ILDA file not found");
+    }
+
+    ilda_preview_result_t *preview = calloc(1, sizeof(*preview));
+    json_chunk_stream_t *stream = malloc(sizeof(*stream));
+    if (!preview || !stream) {
+        free(preview);
+        free(stream);
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "No memory");
+    }
+
+    stream->req = req;
+    stream->chunk_len = 0;
+
+    esp_err_t ret = ilda_preview_analyze(full_path, selected_frame,
+                                         (uint64_t)file_stat.st_size, preview);
+    if (ret != ESP_OK) {
+        free(preview);
+        free(stream);
+
+        if (ret == ESP_ERR_NOT_SUPPORTED) {
+            return send_bad_request(req, "ILDA format is not supported by the player");
+        }
+
+        if (ret == ESP_ERR_NOT_FOUND) {
+            return send_bad_request(req, "Frame index is outside this file");
+        }
+
+        return send_bad_request(req, "Unable to parse ILDA file");
+    }
+
+    if (all_frames && preview->frame_count > ILDA_PREVIEW_MAX_ANIMATED_FRAMES) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "Animated preview supports up to %u frames",
+                 (unsigned)ILDA_PREVIEW_MAX_ANIMATED_FRAMES);
+        free(preview);
+        free(stream);
+        return send_bad_request(req, msg);
+    }
 
     set_common_response_headers(req);
     httpd_resp_set_type(req, "application/json");
-    esp_err_t ret = httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
-    free(json);
+
+    char prefix[384];
+    ret = json_stream_append_formatted(stream, prefix, sizeof(prefix),
+        snprintf(prefix, sizeof(prefix),
+                 "{\"file_size\":%llu,\"frame_count\":%lu,\"total_points\":%lu,"
+                 "\"max_frame_points\":%lu,\"selected_frame\":%lu,\"selected_frame_points\":%lu,"
+                 "\"format_mask\":%lu,\"max_samples\":%lu,\"within_sample_limit\":%s,"
+                 "\"loop_return_samples\":%u,%s",
+                 (unsigned long long)file_stat.st_size,
+                 (unsigned long)preview->frame_count,
+                 (unsigned long)preview->total_points,
+                 (unsigned long)preview->max_frame_points,
+                 (unsigned long)preview->selected_frame,
+                 (unsigned long)preview->selected_frame_points,
+                 (unsigned long)preview->format_mask,
+                 (unsigned long)preview->max_samples,
+                 preview->within_sample_limit ? "true" : "false",
+                 (unsigned)ILDA_LOOP_RETURN_BLANK_SAMPLES,
+                 all_frames ? "\"frames\":[" : "\"points\":["));
+
+    if (ret == ESP_OK) {
+        if (all_frames) {
+            ret = ilda_preview_stream_frames(full_path, (uint64_t)file_stat.st_size,
+                                             preview_frame_stream_cb, stream, preview);
+        } else {
+            ret = preview_stream_points(stream, preview->points, preview->preview_point_count);
+        }
+    }
+
+    if (ret == ESP_OK) {
+        ret = json_stream_append(stream, "]}", 2);
+    }
+
+    if (ret == ESP_OK) {
+        ret = json_stream_finish(stream);
+    }
+
+    free(preview);
+    free(stream);
     return ret;
+}
+
+static void ilda_preview_task(void *arg)
+{
+    (void)arg;
+
+    while (1) {
+        httpd_req_t *req = NULL;
+
+        if (xQueueReceive(s_preview_queue, &req, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        (void)ilda_preview_send(req);
+        httpd_req_async_handler_complete(req);
+    }
+}
+
+static esp_err_t ilda_preview_get_handler(httpd_req_t *req)
+{
+    /*
+       A preview can stream megabytes from the SD card. Hand it to a worker
+       task so the server task stays free for ILDA stop and status requests.
+    */
+    httpd_req_t *async_req = NULL;
+
+    if (httpd_req_async_handler_begin(req, &async_req) != ESP_OK) {
+        return httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Preview unavailable");
+    }
+
+    if (xQueueSend(s_preview_queue, &async_req, 0) != pdTRUE) {
+        set_common_response_headers(async_req);
+        httpd_resp_set_status(async_req, "503 Service Unavailable");
+        httpd_resp_set_type(async_req, "text/plain");
+        httpd_resp_sendstr(async_req, "ERR Preview busy, try again");
+        httpd_req_async_handler_complete(async_req);
+    }
+
+    return ESP_OK;
 }
 
 /* ===================== STATUS ===================== */
@@ -1090,22 +1377,63 @@ static esp_err_t rp_mirror_config_post_handler(httpd_req_t *req)
     return httpd_resp_sendstr(req, "OK");
 }
 
+static bool parse_scale_percent(const char *value, uint8_t *scale_percent)
+{
+    char *end = NULL;
+    unsigned long parsed = strtoul(value, &end, 10);
+
+    if (value[0] == '\0' || !end || *end != '\0' ||
+        parsed < ILDA_SCALE_MIN_PERCENT || parsed > ILDA_SCALE_MAX_PERCENT) {
+        return false;
+    }
+
+    *scale_percent = (uint8_t)parsed;
+    return true;
+}
+
 static esp_err_t ilda_start_post_handler(httpd_req_t *req)
 {
     char query[256];
     char path[192];
+    char scale_value[8];
+    uint8_t scale_percent = ILDA_SCALE_MAX_PERCENT;
 
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
-        strlcpy(path, "/sdcard/test.ild", sizeof(path));
-    } else if (httpd_query_key_value(query, "path", path, sizeof(path)) != ESP_OK) {
-        strlcpy(path, "/sdcard/test.ild", sizeof(path));
+    strlcpy(path, "/sdcard/test.ild", sizeof(path));
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        if (httpd_query_key_value(query, "path", path, sizeof(path)) != ESP_OK) {
+            strlcpy(path, "/sdcard/test.ild", sizeof(path));
+        }
+
+        if (httpd_query_key_value(query, "scale", scale_value, sizeof(scale_value)) == ESP_OK &&
+            !parse_scale_percent(scale_value, &scale_percent)) {
+            return send_bad_request(req, "XY scale must be between 10 and 100 percent");
+        }
     }
 
     url_decode_inplace(path);
 
     rp_manager_stop_test_stream();
 
-    return send_plain_result(req, ilda_player_start(path));
+    return send_plain_result(req, ilda_player_start(path, scale_percent));
+}
+
+static esp_err_t ilda_scale_post_handler(httpd_req_t *req)
+{
+    char query[32];
+    char scale_value[8];
+    uint8_t scale_percent;
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "value", scale_value, sizeof(scale_value)) != ESP_OK) {
+        return send_bad_request(req, "XY scale is required");
+    }
+
+    if (!parse_scale_percent(scale_value, &scale_percent)) {
+        return send_bad_request(req, "XY scale must be between 10 and 100 percent");
+    }
+
+    return send_plain_result(req, ilda_player_set_scale(scale_percent));
 }
 
 static esp_err_t ilda_stop_post_handler(httpd_req_t *req)
@@ -1139,7 +1467,10 @@ static const char *html_page =
 "input,select{background:#171c21;color:#fff;border:1px solid var(--line);border-radius:5px;padding:8px;width:100%;font-family:inherit}.actions{padding:12px 15px}.pill{display:inline-block;border:1px solid var(--line);border-radius:4px;padding:3px 7px;margin:2px;color:#dce4ea}.inlineForm{display:grid;grid-template-columns:1fr auto;gap:8px;align-items:center;margin-top:10px}"
 ".checkrow{display:flex;align-items:center;gap:9px;padding:4px 0}.checkrow input{width:auto}.fieldrow{display:grid;grid-template-columns:1.2fr 1fr;gap:10px;align-items:center;border-bottom:1px solid var(--line);padding:9px 0}.fieldrow:last-child{border-bottom:0}.ipFields{display:none}.saveMsg{min-height:20px;color:var(--muted);padding:0 15px 12px}.saveMsg.ok{color:var(--green2)}.saveMsg.err{color:var(--red)}.note{color:var(--muted);font-size:12px;line-height:1.4;padding:0 15px 12px}"
 ".fileTools{display:flex;align-items:center;gap:8px;flex-wrap:wrap}.fileTools button{margin:0}.tableWrap{overflow:auto;padding:0 15px 15px}.tableWrap table{min-width:100%}"
-"table{width:100%;border-collapse:collapse}.card>table{width:calc(100% - 30px);margin:0 15px 15px}.sdTable{min-width:420px}.sdTable .sizeCol{width:92px}.sdTable .actionCol{width:78px;text-align:right}.sdTable .sizeCell{white-space:nowrap;color:#dce4ea}.sdTable .actionCell{text-align:right}.sdTable .playBtn{margin:0;padding:6px 10px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}th{font-size:12px;color:#dce4ea}.bufInputCol{width:140px}.bufInfoCol{width:120px;white-space:nowrap}.bufInfo{color:var(--muted);font-variant-numeric:tabular-nums}.bufDesc{font-size:12px}.bufActions{display:flex;align-items:center;gap:4px}.bufActions .saveMsg{padding:0 8px;margin:0}"
+".sdTable .previewBtn{margin:0 5px 0 0;padding:6px 9px}.sdTable tr.previewSelected td{background:#28332f}"
+".previewGrid{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(240px,1fr);gap:16px;padding:15px}.previewCanvasWrap{background:#080b0d;border:1px solid var(--line);border-radius:4px;overflow:hidden}.previewCanvasWrap canvas{display:block;width:100%;height:auto;aspect-ratio:8/5}.previewSummary{min-width:0}.previewSummary .rowkv{grid-template-columns:1fr auto;gap:8px}.previewVerdict{padding:12px 0 0;font-weight:700}.previewVerdict.ok{color:var(--green2)}.previewVerdict.warn{color:var(--amber)}.previewVerdict.err{color:var(--red)}.previewFrameLabel{min-width:90px;text-align:center;font-variant-numeric:tabular-nums}"
+".scaleControl{display:flex;align-items:center;gap:10px}.scaleControl input{width:100%;padding:0}.scaleControl output{min-width:44px;text-align:right;font-variant-numeric:tabular-nums}.previewSummary .scaleRow{grid-template-columns:1fr;gap:7px}"
+"table{width:100%;border-collapse:collapse}.card>table{width:calc(100% - 30px);margin:0 15px 15px}.sdTable{min-width:420px}.sdTable .sizeCol{width:92px}.sdTable .actionCol{width:150px;text-align:right}.sdTable .sizeCell{white-space:nowrap;color:#dce4ea}.sdTable .actionCell{text-align:right}.sdTable .playBtn{margin:0;padding:6px 10px}th,td{text-align:left;padding:9px 10px;border-bottom:1px solid var(--line)}th{font-size:12px;color:#dce4ea}.bufInputCol{width:140px}.bufInfoCol{width:120px;white-space:nowrap}.bufInfo{color:var(--muted);font-variant-numeric:tabular-nums}.bufDesc{font-size:12px}.bufActions{display:flex;align-items:center;gap:4px}.bufActions .saveMsg{padding:0 8px;margin:0}"
 "pre{margin:0;background:#14191e;color:#9dffbc;padding:13px;max-height:420px;overflow:auto;font-size:12px}.footer{margin-top:auto;border-top:1px solid #171b20;background:#1a2025;text-align:center;padding:14px 16px;font-size:12px}.footerLink{color:#fff;text-decoration:none;display:inline-flex;align-items:center;justify-content:center}.footerLink:hover{color:#fff}.footerLogo{width:112px;height:auto;display:block}"
 "@media(max-width:900px){.app{display:block}.side{position:sticky;top:0;z-index:5;width:100%;padding:10px 12px;display:block;border-right:0;border-bottom:1px solid #15191d}.brand{padding:0 4px 10px}.brand h1{font-size:clamp(20px,7vw,25px)}.brand p{display:none}.nav{display:flex;gap:6px;overflow-x:auto;padding-bottom:2px}.nav button{flex:0 0 auto;width:auto;height:36px;padding:0 11px;margin:0;white-space:nowrap}.main{margin-left:0;width:100%}.top{height:auto;align-items:flex-start;flex-direction:column;padding:10px}.topActions{justify-content:flex-start}.grid2{grid-template-columns:1fr}.rateGrid{grid-template-columns:repeat(2,minmax(0,1fr))}.content{padding:16px}.rowkv,.fieldrow{grid-template-columns:1fr;gap:5px}}"
 "</style>"
@@ -1225,6 +1556,17 @@ static const char *html_page =
 "<div class='actions' style='padding-top:0'><button id='sdUpBtn' onclick='goSdParent()'>Up</button><span id='sdCurrentPath' class='muted'>/</span></div>"
 "<div class='tableWrap'><table class='sdTable'><thead><tr><th>Name</th><th class='sizeCol'>Size</th><th class='actionCol'>Action</th></tr></thead><tbody id='fileRows'></tbody></table></div>"
 "</div>"
+"<div class='card' id='ildaPreviewCard' style='display:none'><div class='cardHead'><h3 id='ildaPreviewTitle'>ILDA preview</h3><div class='fileTools'><button id='previewProjectBtn' class='green' onclick='startPreviewProject()' disabled>Project</button><button id='previewStopBtn' class='red' onclick='stopPreviewProject()' disabled>Stop</button><button id='previewPrevBtn' onclick='stepPreviewFrame(-1)' aria-label='Previous frame'>Previous</button><button id='previewPlayBtn' onclick='togglePreviewPlayback()' aria-label='Pause preview' aria-pressed='true'>Pause</button><span id='previewFrameLabel' class='previewFrameLabel muted'>Frame --</span><button id='previewNextBtn' onclick='stepPreviewFrame(1)' aria-label='Next frame'>Next</button></div></div>"
+"<div class='previewGrid'><div class='previewCanvasWrap'><canvas id='ildaPreviewCanvas' width='640' height='400' aria-label='Selected ILDA frame preview'></canvas></div><div class='previewSummary'>"
+"<div class='rowkv'><span class='k'>File size</span><span id='previewFileSize' class='v'>--</span></div>"
+"<div class='rowkv'><span class='k'>Frames</span><span id='previewFrameCount' class='v'>--</span></div>"
+"<div class='rowkv'><span class='k'>Total points</span><span id='previewTotalPoints' class='v'>--</span></div>"
+"<div class='rowkv'><span class='k'>Largest frame</span><span id='previewMaxFramePoints' class='v'>--</span></div>"
+"<div class='rowkv'><span class='k'>Frame points</span><span id='previewSelectedPoints' class='v'>--</span></div>"
+"<div class='rowkv'><span class='k'>Formats</span><span id='previewFormats' class='v'>--</span></div>"
+"<div class='fieldrow scaleRow'><label class='k' for='ildaScale'>Output XY scale</label><div class='scaleControl'><input id='ildaScale' type='range' min='10' max='100' step='1' value='100' oninput='onIldaScaleChange()'><output id='ildaScaleValue' for='ildaScale'>100%</output></div></div>"
+"<div class='note' style='padding:8px 0 0'>Reduced scale keeps the pattern centered and narrows its scan angle.</div>"
+"<div id='previewVerdict' class='previewVerdict muted'>Select Preview on an ILDA file.</div></div></div></div>"
 "</section>"
 
 "<section id='protocols' class='section'>"
@@ -1340,7 +1682,15 @@ static const char *html_page =
 "function defaultLow(high){return high>2048?high-2048:Math.max(0,high-256);}"
 "function forceSyncBufInputs(j){let size=Number(j.remote_buffer_size_samples||0);let high=Number(j.remote_buffer_high_water_samples||0);let low=Number(j.remote_buffer_low_water_samples||0);if(size&&!high)high=defaultHigh(size);setVal('bufSizeInput',size||'');setVal('bufHighInput',high||'');setVal('bufLowInput',low);}"
 "function saveBufferSettings(){let size=Number(val('bufSizeInput'));let high=Number(val('bufHighInput'));let low=Number(val('bufLowInput'));let max=lastRpStatus?Number(lastRpStatus.remote_buffer_max_samples||0):0;if(!Number.isInteger(size)||!Number.isInteger(high)||!Number.isInteger(low)||size<512||high<256||low<0){setBufMsg('Enter valid whole-number buffer limits','err');return;}if(max&&size>max){setBufMsg('Buffer size is above the RP maximum','err');return;}if(high>size-256){setBufMsg('High-water limit must leave at least 256 samples of headroom','err');return;}if(low>high-256){setBufMsg('Low-water limit must be at least 256 samples below high-water','err');return;}let p=new URLSearchParams();p.set('size',size);p.set('high_water',high);p.set('low_water',low);setBufMsg('Saving to RP flash...','ok');return fetch('/api/rp/buffer_config',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:p.toString()}).then(r=>r.text().then(t=>{if(!r.ok||!t.startsWith('OK')){throw new Error(t.startsWith('ERR ')?t.substring(4):t);}setBufMsg('Saved and applied.','ok');bufDirty=false;document.getElementById('bufCancelBtn').style.display='none';setTimeout(update,120);return t;})).catch(e=>setBufMsg(e.message||'Save failed','err'));}"
-"function playIldaPath(p){post('/api/ilda/start?path='+encodeURIComponent(p));}"
+"function startIldaProject(path,relativePath){let scale=Number(val('ildaScale'))||100;return post('/api/ilda/start?path='+encodeURIComponent(path)+'&scale='+scale).then(result=>{if(result.trim()==='OK'){activePreviewProjectPath=relativePath;syncPreviewProjectControls({ilda_running:true});setTimeout(update,120);}else{setText('previewVerdict',result);setClass('previewVerdict','previewVerdict err');}});}"
+"function playIldaPath(p){let relativePath=p.startsWith('/sdcard/')?p.substring(8):p;startIldaProject(p,relativePath);}"
+"function startPreviewProject(){if(!previewPath)return;startIldaProject('/sdcard/'+previewPath,previewPath);}"
+"function stopPreviewProject(){return post('/api/ilda/stop').then(result=>{if(result.trim()==='OK'){activePreviewProjectPath='';syncPreviewProjectControls({ilda_running:false});setText('previewVerdict','Projection stopped.');setClass('previewVerdict','previewVerdict ok');}else{setText('previewVerdict',result);setClass('previewVerdict','previewVerdict err');}setTimeout(update,120);});}"
+"let previewPath='';let previewFrame=0;let previewFrameCount=0;let previewFramePoints=0;let previewRequestId=0;let previewPlaying=false;let previewTimer=0;let activePreviewProjectPath='';let previewScaleTimer=0;let previewLoopReturnSamples=0;let previewAbort=null;"
+"let previewPoints=[];function onIldaScaleChange(){let scale=Number(val('ildaScale'))||100;let output=document.getElementById('ildaScaleValue');if(output)output.value=scale+'%';drawIldaPreview(previewPoints);if(activePreviewProjectPath===previewPath){if(previewScaleTimer)clearTimeout(previewScaleTimer);previewScaleTimer=setTimeout(()=>{post('/api/ilda/scale?value='+scale).then(result=>{if(result.trim()!=='OK'){setText('previewVerdict',result);setClass('previewVerdict','previewVerdict err');}});},100);}}"
+"function syncPreviewProjectControls(status){let running=!!(status&&status.ilda_running);if(!running)activePreviewProjectPath='';let sameFile=running&&activePreviewProjectPath===previewPath;let start=document.getElementById('previewProjectBtn');let stop=document.getElementById('previewStopBtn');if(start){start.disabled=!previewPath||sameFile;start.textContent=sameFile?'Projecting':'Project';}if(stop)stop.disabled=!running;}"
+"function setPreviewPlayback(playing){previewPlaying=playing;if(previewTimer)clearTimeout(previewTimer);previewTimer=0;let button=document.getElementById('previewPlayBtn');if(button){button.textContent=playing?'Pause':'Play';button.setAttribute('aria-label',playing?'Pause preview':'Play preview');button.setAttribute('aria-pressed',playing?'true':'false');}if(!playing)previewRequestId++;}"
+"function drawIldaPreview(points){if(points)previewPoints=points;let canvas=document.getElementById('ildaPreviewCanvas');if(!canvas)return;let ctx=canvas.getContext('2d');let w=canvas.width,h=canvas.height;ctx.clearRect(0,0,w,h);ctx.fillStyle='#080b0d';ctx.fillRect(0,0,w,h);ctx.strokeStyle='#202a30';ctx.lineWidth=1;for(let i=1;i<4;i++){let x=w*i/4,y=h*i/4;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke();}ctx.strokeStyle='#39464e';ctx.beginPath();ctx.moveTo(w/2,0);ctx.lineTo(w/2,h);ctx.moveTo(0,h/2);ctx.lineTo(w,h/2);ctx.stroke();let margin=24,scaleX=(w-margin*2)/65535,scaleY=(h-margin*2)/65535,xyScale=(Number(val('ildaScale'))||100)/100,previous=null;ctx.lineWidth=1.5;ctx.lineCap='round';ctx.lineJoin='round';previewPoints.forEach(p=>{let point={x:margin+(32768+p[0]*xyScale)*scaleX,y:margin+(32767-p[1]*xyScale)*scaleY,blanked:!!p[5],r:p[2],g:p[3],b:p[4]};if(previous&&!previous.blanked&&!point.blanked){ctx.strokeStyle='rgb('+point.r+','+point.g+','+point.b+')';ctx.beginPath();ctx.moveTo(previous.x,previous.y);ctx.lineTo(point.x,point.y);ctx.stroke();}previous=point;});}"
 "function val(id){let e=document.getElementById(id);return e?e.value:'';}"
 "function setVal(id,v){let e=document.getElementById(id);if(e)e.value=(v===0||v)?v:'';}"
 "function setValIfIdle(id,v){let e=document.getElementById(id);if(e&&document.activeElement!==e)e.value=(v===0||v)?v:'';}"
@@ -1363,7 +1713,7 @@ static const char *html_page =
 "function fmtRate(v){return v>=1000?(v/1000).toFixed(1)+' k/s':v.toFixed(0);}"
 "function fmtBuffer(j){return j.remote_buffer_size_samples?j.remote_buffer_fill_samples+'/'+j.remote_buffer_size_samples:j.remote_buffer_fill_samples;}"
 "function goSdParent(){let i=currentSdPath.lastIndexOf('/');loadSdFiles(i<0?'':currentSdPath.slice(0,i));}"
-"function loadSdFiles(path){if(path===undefined)path=currentSdPath;let url='/api/sd/list';if(path)url+='?path='+encodeURIComponent(path);fetch(url).then(r=>r.json()).then(j=>{let body=document.getElementById('fileRows');if(!body)return;body.replaceChildren();currentSdPath=j.current||'';setText('sdCurrentPath','/'+currentSdPath);let up=document.getElementById('sdUpBtn');if(up)up.disabled=!currentSdPath;if(!j.files)return;j.files.forEach(f=>{let tr=document.createElement('tr');let name=document.createElement('td');name.textContent=f.name;tr.appendChild(name);let size=document.createElement('td');size.className='sizeCell';size.textContent=f.is_dir?'--':fmtBytes(f.size);tr.appendChild(size);let action=document.createElement('td');action.className='actionCell';if(f.is_dir){let open=document.createElement('button');open.textContent='Open';open.onclick=()=>loadSdFiles(f.browse_path);action.appendChild(open);}else if(f.name.toLowerCase().endsWith('.ild')){let play=document.createElement('button');play.className='green playBtn';play.textContent='Play';play.onclick=()=>playIldaPath(f.path);action.appendChild(play);}else{action.textContent='--';}tr.appendChild(action);body.appendChild(tr);});}).catch(e=>{let body=document.getElementById('fileRows');if(body)body.replaceChildren();});}"
+"function loadSdFiles(path){if(path===undefined)path=currentSdPath;let url='/api/sd/list';if(path)url+='?path='+encodeURIComponent(path);fetch(url).then(r=>r.json()).then(j=>{let body=document.getElementById('fileRows');if(!body)return;body.replaceChildren();currentSdPath=j.current||'';setText('sdCurrentPath','/'+currentSdPath);let up=document.getElementById('sdUpBtn');if(up)up.disabled=!currentSdPath;if(!j.files)return;j.files.forEach(f=>{let tr=document.createElement('tr');tr.dataset.path=f.browse_path||'';let name=document.createElement('td');name.textContent=f.name;tr.appendChild(name);let size=document.createElement('td');size.className='sizeCell';size.textContent=f.is_dir?'--':fmtBytes(f.size);tr.appendChild(size);let action=document.createElement('td');action.className='actionCell';if(f.is_dir){let open=document.createElement('button');open.textContent='Open';open.onclick=()=>loadSdFiles(f.browse_path);action.appendChild(open);}else if(f.name.toLowerCase().endsWith('.ild')){let preview=document.createElement('button');preview.className='previewBtn';preview.textContent='Preview';preview.onclick=()=>{document.querySelectorAll('.sdTable tr.previewSelected').forEach(row=>row.classList.remove('previewSelected'));tr.classList.add('previewSelected');loadIldaPreview(f.browse_path,0);};action.appendChild(preview);let play=document.createElement('button');play.className='green playBtn';play.textContent='Play';play.onclick=()=>playIldaPath(f.path);action.appendChild(play);}else{action.textContent='--';}tr.appendChild(action);body.appendChild(tr);});}).catch(e=>{let body=document.getElementById('fileRows');if(body)body.replaceChildren();});}"
 "function syncSdFiles(j){let sig=[j.sd_inserted?1:0,j.sd_mounted?1:0,j.sd_file_count||0].join(':');if(sig!==lastSdSig){lastSdSig=sig;loadSdFiles();}}"
 "function syncProtocolRates(){setText('protoRateSd',fmtRate(rates.sd));setText('protoRateIdn',fmtRate(rates.idn));setText('protoRateEther',fmtRate(rates.ether));setText('protoRateIlw',fmtRate(rates.ilw));setText('protoStateSd',rates.sd>0?'Active':'Idle');setText('protoStateIdn',rates.idn>0?'Active':'Idle');setText('protoStateEther',rates.ether>0?'Active':'Idle');setText('protoStateIlw',rates.ilw>0?'Active':'Idle');setClass('protoStateSd',rates.sd>0?'v status-ok':'muted');setClass('protoStateIdn',rates.idn>0?'v status-ok':'muted');setClass('protoStateEther',rates.ether>0?'v status-ok':'muted');setClass('protoStateIlw',rates.ilw>0?'v status-ok':'muted');}"
 "function countFromBase(j,k){let b=diagBase?Number(diagBase[k]||0):0;return Math.max(0,Number(j[k]||0)-b);}"
@@ -1379,7 +1729,14 @@ static const char *html_page =
 "function syncBufferFields(j){let rpMax=Number(j.remote_buffer_max_samples||0);let rpSize=Number(j.remote_buffer_size_samples||0);let rpHigh=Number(j.remote_buffer_high_water_samples||0);let rpLow=Number(j.remote_buffer_low_water_samples||0);let sizeLimit=rpMax||rpSize;let highLimit=rpSize>256?rpSize-256:0;if(rpSize&&!rpHigh)rpHigh=defaultHigh(rpSize);let lowLimit=rpHigh>256?rpHigh-256:0;setText('bufSizeInfo',rpSize?(rpSize+' / '+sizeLimit):'--');setText('bufHighInfo',rpHigh?(rpHigh+' / '+highLimit):'--');setText('bufLowInfo',rpHigh?(rpLow+' / '+lowLimit):'--');if(!bufDirty){setValIfIdle('bufSizeInput',rpSize||'');setValIfIdle('bufHighInput',rpHigh||'');setValIfIdle('bufLowInput',rpLow);}}"
 "function updateBufferMeter(j){let size=Number(j.remote_buffer_size_samples||0);let fill=Number(j.remote_buffer_fill_samples||0);let low=Number(j.remote_buffer_low_water_samples||0);let high=Number(j.remote_buffer_high_water_samples||0);let lf=size?Math.max(0,Math.min(100,low*100/size)):0;let hf=size?Math.max(lf,Math.min(100,high*100/size)):0;let ff=size?Math.max(0,Math.min(100,fill*100/size)):0;let f=document.getElementById('topBufferFill');let lm=document.getElementById('topBufLowMark');let hm=document.getElementById('topBufHighMark');if(f){f.style.width=ff+'%';f.style.background=!size?'rgba(74,163,255,.35)':fill>=high?'rgba(217,155,40,.55)':fill<low?'rgba(29,191,115,.5)':'rgba(74,163,255,.45)';}if(lm)lm.style.left=lf+'%';if(hm)hm.style.left=hf+'%';}"
 "function render(j){lastRpStatus=j;calcRates(j);setButtonState(j.remote_running);syncBufferFields(j);syncMirrorFields(j);syncSdFiles(j);syncProtocolRates();syncDiagnosticTotals(j);updateBufferMeter(j);let dacEngineOk=!!j.initialized;let dacRun=!!j.remote_running;let bufferText=fmtBuffer(j);if(j.product)document.title=j.product;setText('brandName',j.product);setText('aboutEspFw',j.esp_fw);setText('aboutRpFw',j.rp_fw);setText('topRate',fmtKpps(j.remote_sample_rate));setText('topFill',bufferText);setClass('topConn',dacEngineOk?'topItem ok':'topItem bad');setClass('topState',dacRun?'topItem ok':'topItem bad');setText('dashUnderrunRate',rates.underruns.toFixed(1));setText('dashPayloadRate',rates.payload.toFixed(1));setClass('dashUnderrunRate',rates.underruns>0?'v status-warn':'v status-ok');setClass('dashPayloadRate',rates.payload>0?'v status-bad':'v status-ok');document.getElementById('status').innerText=JSON.stringify(diagnosticStatus(j),null,2);}"
-"function update(){fetch('/api/rp/status',{cache:'no-store'}).then(r=>r.json()).then(render).catch(e=>{setClass('topConn','topItem bad');});}"
+"function update(){fetch('/api/rp/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{render(j);syncPreviewProjectControls(j);}).catch(e=>{setClass('topConn','topItem bad');});}"
+"let previewFrames=[];"
+"function showPreviewFrame(frame){if(frame<0||frame>=previewFrameCount)return;previewFrame=frame;let current=previewFrames[frame];previewFramePoints=Number(current.point_count)||0;setText('previewFrameLabel','Frame '+(frame+1)+' / '+previewFrameCount);setText('previewSelectedPoints',previewFramePoints.toLocaleString());document.getElementById('previewPrevBtn').disabled=frame===0;document.getElementById('previewNextBtn').disabled=frame+1>=previewFrameCount;document.getElementById('previewPlayBtn').disabled=previewFrameCount<2;drawIldaPreview(current.points||[]);}"
+"function previewFrameDurationMs(points,frame){let rate=Number(lastRpStatus&&lastRpStatus.remote_sample_rate)||30000;let samples=Number(points)||0;if(frame===previewFrameCount-1)samples+=previewLoopReturnSamples;return samples*1000/rate;}"
+"function schedulePreviewFrame(frame,requestId){if(!previewPlaying||previewFrameCount<2)return;let delay=previewFrameDurationMs(previewFrames[frame].point_count,frame);previewTimer=setTimeout(()=>{if(!previewPlaying||requestId!==previewRequestId)return;let next=(frame+1)%previewFrameCount;showPreviewFrame(next);schedulePreviewFrame(next,requestId);},delay);}"
+"function togglePreviewPlayback(){if(previewPlaying){setPreviewPlayback(false);return;}if(!previewPath||previewFrames.length<2)return;setPreviewPlayback(true);schedulePreviewFrame(previewFrame,previewRequestId);}"
+"function stepPreviewFrame(step){let next=previewFrame+step;if(next<0||next>=previewFrameCount)return;if(previewTimer)clearTimeout(previewTimer);previewTimer=0;showPreviewFrame(next);if(previewPlaying)schedulePreviewFrame(next,previewRequestId);}"
+"function loadIldaPreview(path,frame){setPreviewPlayback(true);previewPath=path;let requestedFrame=frame||0;let requestId=++previewRequestId;let card=document.getElementById('ildaPreviewCard');card.style.display='block';setText('ildaPreviewTitle',path.split('/').pop()+' preview');setText('previewVerdict','Loading animation...');setClass('previewVerdict','previewVerdict muted');setText('previewFrameLabel','Loading');setText('previewFileSize','--');setText('previewFrameCount','--');setText('previewTotalPoints','--');setText('previewMaxFramePoints','--');setText('previewSelectedPoints','--');setText('previewFormats','--');previewFrames=[];previewFrameCount=0;drawIldaPreview([]);if(previewAbort)previewAbort.abort();previewAbort=new AbortController();let url='/api/ilda/preview?path='+encodeURIComponent(path)+'&frame='+requestedFrame+'&all=1';fetch(url,{cache:'no-store',signal:previewAbort.signal}).then(r=>r.text().then(t=>{if(!r.ok)throw new Error(t||'Preview request failed');return JSON.parse(t);})).then(j=>{if(requestId!==previewRequestId)return;if(!Array.isArray(j.frames)||j.frames.length!==j.frame_count)throw new Error('Animated preview data is incomplete');previewFrames=j.frames;previewFrameCount=previewFrames.length;previewLoopReturnSamples=Number(j.loop_return_samples)||0;setText('previewFileSize',fmtBytes(j.file_size));setText('previewFrameCount',j.frame_count.toLocaleString());setText('previewTotalPoints',j.total_points.toLocaleString());setText('previewMaxFramePoints',j.max_frame_points.toLocaleString());let formats=[];[0,1,4,5].forEach(f=>{if(j.format_mask&(1<<f))formats.push('Format '+f);});setText('previewFormats',formats.join(', '));setText('previewVerdict',j.within_sample_limit?'Within the player sample-count limit ('+Number(j.max_samples).toLocaleString()+')':'Exceeds the player sample-count limit ('+Number(j.max_samples).toLocaleString()+')');setClass('previewVerdict','previewVerdict '+(j.within_sample_limit?'ok':'warn'));showPreviewFrame(Math.min(requestedFrame,previewFrameCount-1));if(previewPlaying)schedulePreviewFrame(previewFrame,requestId);}).catch(e=>{if(requestId!==previewRequestId)return;setPreviewPlayback(false);previewFrames=[];previewFrameCount=0;setText('previewFrameLabel','Unavailable');setText('previewVerdict',e.message||'Unable to preview ILDA file');setClass('previewVerdict','previewVerdict err');document.getElementById('previewPrevBtn').disabled=true;document.getElementById('previewNextBtn').disabled=true;document.getElementById('previewPlayBtn').disabled=true;drawIldaPreview([]);});}"
 "function boot(){syncTestColorButtons();loadNetworkSettings();loadProtocolSettings();refreshEngine().finally(()=>{update();});}"
 "setInterval(update,2000);boot();"
 "</script>"
@@ -1437,6 +1794,27 @@ esp_err_t web_server_start(void)
 
     ESP_LOGI(TAG, "Starting web server");
 
+    if (!s_preview_queue) {
+        s_preview_queue = xQueueCreate(WEB_PREVIEW_QUEUE_LENGTH, sizeof(httpd_req_t *));
+        if (!s_preview_queue) {
+            return ESP_ERR_NO_MEM;
+        }
+
+        BaseType_t ok = xTaskCreate(
+            ilda_preview_task,
+            "ilda_preview",
+            WEB_PREVIEW_TASK_STACK_BYTES,
+            NULL,
+            tskIDLE_PRIORITY + 1,
+            NULL
+        );
+
+        if (ok != pdPASS) {
+            ESP_LOGE(TAG, "Failed to start ILDA preview task");
+            return ESP_ERR_NO_MEM;
+        }
+    }
+
     esp_err_t ret = httpd_start(&s_server, &config);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "HTTP server start failed: %s", esp_err_to_name(ret));
@@ -1445,6 +1823,7 @@ esp_err_t web_server_start(void)
 
     ESP_ERROR_CHECK(register_handler("/", HTTP_GET, root_get_handler));
     ESP_ERROR_CHECK(register_handler("/api/sd/list", HTTP_GET, sd_list_get_handler));
+    ESP_ERROR_CHECK(register_handler("/api/ilda/preview", HTTP_GET, ilda_preview_get_handler));
     ESP_ERROR_CHECK(register_handler("/api/network/config", HTTP_GET, network_config_get_handler));
     ESP_ERROR_CHECK(register_handler("/api/network/config", HTTP_POST, network_config_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/protocols/config", HTTP_GET, protocol_config_get_handler));
@@ -1466,6 +1845,7 @@ esp_err_t web_server_start(void)
     ESP_ERROR_CHECK(register_handler("/api/rp/mirror_config", HTTP_POST, rp_mirror_config_post_handler));
 
     ESP_ERROR_CHECK(register_handler("/api/ilda/start", HTTP_POST, ilda_start_post_handler));
+    ESP_ERROR_CHECK(register_handler("/api/ilda/scale", HTTP_POST, ilda_scale_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/ilda/stop", HTTP_POST, ilda_stop_post_handler));
     ESP_ERROR_CHECK(register_handler("/*", HTTP_GET, captive_portal_get_handler));
 

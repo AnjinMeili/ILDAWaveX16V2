@@ -13,6 +13,7 @@
 #include "esp_heap_caps.h"
 
 #include "app_config.h"
+#include "ilda_format.h"
 #include "ilda_player.h"
 #include "rp_manager.h"
 #include "protocol_stream_stats.h"
@@ -20,7 +21,6 @@
 static const char *TAG = "ilda";
 
 #define PSRAM_LIMIT_BYTES (1400 * 1024)
-#define ILDA_LOOP_RETURN_BLANK_SAMPLES 64
 
 typedef struct {
     int16_t ch[RP_SAMPLE_CHANNELS];
@@ -28,6 +28,7 @@ typedef struct {
 
 static TaskHandle_t s_sender_task = NULL;
 static volatile bool s_stop = false;
+static volatile uint8_t s_scale_percent = 100;
 
 static sample_t *s_samples = NULL;
 static size_t s_sample_count = 0;
@@ -51,70 +52,14 @@ static inline TickType_t delay_ticks_ms(uint32_t ms)
 static inline void suspend_idle0_wdt_for_v1_sender(void) {}
 static inline void resume_idle0_wdt_after_v1_sender(void) {}
 
-static uint16_t be16(const uint8_t *p)
-{
-    return ((uint16_t)p[0] << 8) | p[1];
-}
-
 static int16_t be_i16(const uint8_t *p)
 {
-    return (int16_t)be16(p);
+    return (int16_t)ilda_be16(p);
 }
 
 static int16_t color_to_sample(uint8_t c)
 {
     return (int16_t)(((int32_t)c * 65535 / 255) - 32768);
-}
-
-static void default_index_color(uint8_t idx, uint8_t *r, uint8_t *g, uint8_t *b)
-{
-    /*
-       ILDA format 0/1 uses an indexed palette. Many simple ILDA files do not
-       include a format-2 palette section and instead rely on the common ILDA
-       default palette. TEST_12K.ILD is one of those files: it uses indices
-       0, 8, 16, 24, 40, 48, 56.
-
-       The previous code used idx & 7, so all multiples of 8 became index 0
-       -> black. That made the mirrors move while the laser stayed off.
-
-       Keep compatibility with tiny 0..7 palettes, but also support common
-       64-entry ILDA-style indices by mapping 0,8,16,...,56 to 0..7.
-    */
-    static const uint8_t pal8[8][3] = {
-        {0,   0,   0  }, /* 0 black */
-        {255, 0,   0  }, /* 1 red */
-        {0,   255, 0  }, /* 2 green */
-        {255, 255, 0  }, /* 3 yellow */
-        {0,   0,   255}, /* 4 blue */
-        {255, 0,   255}, /* 5 magenta */
-        {0,   255, 255}, /* 6 cyan */
-        {255, 255, 255}, /* 7 white */
-    };
-
-    uint8_t pal_index;
-
-    if (idx < 8) {
-        pal_index = idx;
-    } else {
-        pal_index = idx >> 3;
-        if (pal_index > 7) {
-            pal_index = 7;
-        }
-    }
-
-    const uint8_t *c = pal8[pal_index];
-    *r = c[0];
-    *g = c[1];
-    *b = c[2];
-}
-
-static int record_size_for_format(uint8_t format)
-{
-    if (format == 0) return 8;
-    if (format == 1) return 6;
-    if (format == 4) return 10;
-    if (format == 5) return 8;
-    return -1;
 }
 
 static void make_sample(
@@ -170,10 +115,13 @@ static int16_t lerp_sample_channel(int16_t from, int16_t to, uint32_t step, uint
 static void make_blanked_return_sample(const int16_t from[RP_SAMPLE_CHANNELS],
                                        const int16_t to[RP_SAMPLE_CHANNELS],
                                        uint32_t step,
+                                       uint8_t scale_percent,
                                        int16_t out[RP_SAMPLE_CHANNELS])
 {
-    out[0] = lerp_sample_channel(from[0], to[0], step, ILDA_LOOP_RETURN_BLANK_SAMPLES);
-    out[1] = lerp_sample_channel(from[1], to[1], step, ILDA_LOOP_RETURN_BLANK_SAMPLES);
+    int16_t x = lerp_sample_channel(from[0], to[0], step, ILDA_LOOP_RETURN_BLANK_SAMPLES);
+    int16_t y = lerp_sample_channel(from[1], to[1], step, ILDA_LOOP_RETURN_BLANK_SAMPLES);
+    out[0] = (int16_t)((int32_t)x * scale_percent / 100);
+    out[1] = (int16_t)((int32_t)y * scale_percent / 100);
 
     for (int ch = 2; ch < RP_SAMPLE_CHANNELS; ch++) {
         out[ch] = -32768;
@@ -193,12 +141,12 @@ static void parse_record(uint8_t format, const uint8_t *rec, sample_t *out)
         x = be_i16(&rec[0]);
         y = be_i16(&rec[2]);
         blanked = (rec[6] & 0x40) != 0;
-        default_index_color(rec[7], &r, &g, &b);
+        ilda_default_index_color(rec[7], &r, &g, &b);
     } else if (format == 1) {
         x = be_i16(&rec[0]);
         y = be_i16(&rec[2]);
         blanked = (rec[4] & 0x40) != 0;
-        default_index_color(rec[5], &r, &g, &b);
+        ilda_default_index_color(rec[5], &r, &g, &b);
     } else if (format == 4) {
         x = be_i16(&rec[0]);
         y = be_i16(&rec[2]);
@@ -228,11 +176,16 @@ static void free_samples(void)
     s_sample_count = 0;
 }
 
+size_t ilda_player_max_samples(void)
+{
+    return PSRAM_LIMIT_BYTES / sizeof(sample_t);
+}
+
 static esp_err_t preflight_ilda(FILE *f, size_t *sample_count)
 {
     uint8_t discard[256];
     size_t total_samples = 0;
-    size_t max_samples = PSRAM_LIMIT_BYTES / sizeof(sample_t);
+    size_t max_samples = ilda_player_max_samples();
 
     if (fseek(f, 0, SEEK_SET) != 0) {
         return ESP_ERR_INVALID_SIZE;
@@ -256,12 +209,12 @@ static esp_err_t preflight_ilda(FILE *f, size_t *sample_count)
         }
 
         uint8_t format = header[7];
-        uint16_t records = be16(&header[24]);
+        uint16_t records = ilda_be16(&header[24]);
         if (records == 0) {
             break;
         }
 
-        int rec_size = record_size_for_format(format);
+        int rec_size = ilda_record_size_for_format(format);
         if (rec_size <= 0) {
             return ESP_ERR_NOT_SUPPORTED;
         }
@@ -308,7 +261,6 @@ static esp_err_t load_ilda_to_psram(const char *path)
 
     free_samples();
 
-    size_t max_samples = PSRAM_LIMIT_BYTES / sizeof(sample_t);
     size_t expected_samples = 0;
     esp_err_t ret = preflight_ilda(f, &expected_samples);
     if (ret != ESP_OK) {
@@ -345,13 +297,13 @@ static esp_err_t load_ilda_to_psram(const char *path)
         }
 
         uint8_t format = header[7];
-        uint16_t records = be16(&header[24]);
+        uint16_t records = ilda_be16(&header[24]);
 
         if (records == 0) {
             break;
         }
 
-        int rec_size = record_size_for_format(format);
+        int rec_size = ilda_record_size_for_format(format);
         if (rec_size <= 0) {
             ESP_LOGE(TAG, "Unsupported ILDA format %u", format);
             fclose(f);
@@ -368,11 +320,12 @@ static esp_err_t load_ilda_to_psram(const char *path)
                 return ESP_ERR_INVALID_SIZE;
             }
 
-            if (count >= expected_samples || count >= max_samples) {
+            if (count >= expected_samples) {
                 fclose(f);
                 free_samples();
-                ESP_LOGE(TAG, "ILDA too large for memory. Max converted samples=%u", (unsigned int)max_samples);
-                return ESP_ERR_NO_MEM;
+                ESP_LOGE(TAG, "ILDA grew while loading: expected %u samples",
+                         (unsigned int)expected_samples);
+                return ESP_ERR_INVALID_SIZE;
             }
 
             parse_record(format, rec, &s_samples[count]);
@@ -453,11 +406,23 @@ static void sender_task(void *arg)
         return;
     }
 
+    uint8_t scale_percent = s_scale_percent;
+
     while (!s_stop) {
         uint32_t pc = 0;
 
         for (size_t i = 0; i < s_sample_count && !s_stop; i++) {
+            /*
+               Pick up XY scale changes at packet boundaries so the web slider
+               takes effect within one packet, not one full file loop.
+            */
+            if (pc == 0) {
+                scale_percent = s_scale_percent;
+            }
+
             memcpy(packet[pc], s_samples[i].ch, sizeof(packet[pc]));
+            packet[pc][0] = (int16_t)((int32_t)packet[pc][0] * scale_percent / 100);
+            packet[pc][1] = (int16_t)((int32_t)packet[pc][1] * scale_percent / 100);
             pc++;
 
             if (pc >= RP_STREAM_SAMPLES_PER_PACKET) {
@@ -490,7 +455,11 @@ static void sender_task(void *arg)
             const int16_t *first = s_samples[0].ch;
 
             for (uint32_t step = 1; step <= ILDA_LOOP_RETURN_BLANK_SAMPLES && !s_stop; step++) {
-                make_blanked_return_sample(last, first, step, packet[pc]);
+                if (pc == 0) {
+                    scale_percent = s_scale_percent;
+                }
+
+                make_blanked_return_sample(last, first, step, scale_percent, packet[pc]);
                 pc++;
 
                 if (pc >= RP_STREAM_SAMPLES_PER_PACKET) {
@@ -559,9 +528,10 @@ static void sender_task(void *arg)
     vTaskDelete(NULL);
 }
 
-esp_err_t ilda_player_start(const char *path)
+esp_err_t ilda_player_start(const char *path, uint8_t scale_percent)
 {
-    if (!path || path[0] == '\0') {
+    if (!path || path[0] == '\0' ||
+        scale_percent < ILDA_SCALE_MIN_PERCENT || scale_percent > ILDA_SCALE_MAX_PERCENT) {
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -581,8 +551,10 @@ esp_err_t ilda_player_start(const char *path)
     }
 
     s_stop = false;
+    s_scale_percent = scale_percent;
 
-    ESP_LOGI(TAG, "Starting ILDA memory playback: %s", path);
+    ESP_LOGI(TAG, "Starting ILDA memory playback: %s at %u%% XY scale",
+             path, (unsigned int)scale_percent);
 
     ret = load_ilda_to_psram(path);
     if (ret != ESP_OK) {
@@ -609,6 +581,19 @@ esp_err_t ilda_player_start(const char *path)
         return ESP_ERR_NO_MEM;
     }
 
+    return ESP_OK;
+}
+
+esp_err_t ilda_player_set_scale(uint8_t scale_percent)
+{
+    if (scale_percent < ILDA_SCALE_MIN_PERCENT || scale_percent > ILDA_SCALE_MAX_PERCENT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!ilda_player_is_running()) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    s_scale_percent = scale_percent;
     return ESP_OK;
 }
 
