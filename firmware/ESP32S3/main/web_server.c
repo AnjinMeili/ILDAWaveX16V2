@@ -33,6 +33,8 @@ static TaskHandle_t s_refresh_task = NULL;
 
 #define WEB_SERVER_TASK_STACK_BYTES 16384
 #define WEB_SD_LIST_JSON_BYTES 2048
+#define WEB_SD_PATH_MAX 191
+#define WEB_SD_REL_PATH_MAX (WEB_SD_PATH_MAX - sizeof(SD_MOUNT_POINT))
 #define WEB_RP_STATUS_JSON_BYTES 1920
 #define WEB_NETWORK_JSON_BYTES 2048
 #define WEB_PROTOCOL_JSON_BYTES 960
@@ -236,12 +238,63 @@ static esp_err_t read_request_body(httpd_req_t *req, char *body, size_t body_len
 
 /* ===================== SD LIST ===================== */
 
+static bool valid_sd_relative_path(const char *path)
+{
+    if (!path || path[0] == '/' || path[0] == '\\' ||
+        strlen(path) > WEB_SD_REL_PATH_MAX) {
+        return false;
+    }
+
+    if (path[0] == '\0') {
+        return true;
+    }
+
+    const char *segment = path;
+    for (const char *cursor = path;; cursor++) {
+        unsigned char ch = (unsigned char)*cursor;
+        if (ch == '\\' || ch < 0x20) {
+            return false;
+        }
+
+        if (ch == '/' || ch == '\0') {
+            size_t segment_len = (size_t)(cursor - segment);
+            if (segment_len == 0 ||
+                (segment_len == 1 && segment[0] == '.') ||
+                (segment_len == 2 && segment[0] == '.' && segment[1] == '.')) {
+                return false;
+            }
+            if (ch == '\0') {
+                break;
+            }
+            segment = cursor + 1;
+        }
+    }
+
+    return true;
+}
+
 static esp_err_t sd_list_get_handler(httpd_req_t *req)
 {
     (void)sd_manager_rescan();
 
     sd_status_t sd = {0};
     sd_manager_get_status(&sd);
+
+    char query[WEB_SD_REL_PATH_MAX * 3 + 16] = {0};
+    char encoded_path[WEB_SD_REL_PATH_MAX * 3 + 1] = {0};
+    char current_path[WEB_SD_REL_PATH_MAX + 1] = {0};
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
+        esp_err_t query_ret = httpd_query_key_value(query, "path", encoded_path, sizeof(encoded_path));
+        if (query_ret == ESP_OK) {
+            url_decode_inplace(encoded_path);
+            if (!valid_sd_relative_path(encoded_path)) {
+                return send_bad_request(req, "Invalid SD directory path");
+            }
+            strlcpy(current_path, encoded_path, sizeof(current_path));
+        } else if (strstr(query, "path=") != NULL) {
+            return send_bad_request(req, "SD directory path is too long");
+        }
+    }
 
     char *json = malloc(WEB_SD_LIST_JSON_BYTES);
     if (!json) {
@@ -255,20 +308,41 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
         free(json);
         set_common_response_headers(req);
         httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"mounted\":false,\"count\":0,\"files\":[]}");
+        return httpd_resp_sendstr(req, "{\"mounted\":false,\"current\":\"\",\"count\":0,\"files\":[]}");
     }
 
-    DIR *dir = opendir("/sdcard");
+    char directory_path[WEB_SD_PATH_MAX + 1];
+    int directory_path_len = current_path[0]
+        ? snprintf(directory_path, sizeof(directory_path), "%s/%s", SD_MOUNT_POINT, current_path)
+        : snprintf(directory_path, sizeof(directory_path), "%s", SD_MOUNT_POINT);
+    if (directory_path_len < 0 || directory_path_len >= sizeof(directory_path)) {
+        free(json);
+        return send_bad_request(req, "SD directory path is too long");
+    }
+
+    struct stat directory_stat;
+    if (stat(directory_path, &directory_stat) != 0 || !S_ISDIR(directory_stat.st_mode)) {
+        free(json);
+        set_common_response_headers(req);
+        httpd_resp_set_status(req, "404 Not Found");
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "{\"error\":\"Directory not found\"}");
+    }
+
+    DIR *dir = opendir(directory_path);
 
     if (!dir) {
         free(json);
         set_common_response_headers(req);
         httpd_resp_set_type(req, "application/json");
-        return httpd_resp_sendstr(req, "{\"mounted\":false,\"count\":0,\"files\":[]}");
+        return httpd_resp_sendstr(req, "{\"mounted\":false,\"current\":\"\",\"count\":0,\"files\":[]}");
     }
 
+    char escaped_current[WEB_SD_REL_PATH_MAX * 2 + 1];
+    json_escape(current_path, escaped_current, sizeof(escaped_current));
     off += snprintf(json + off, WEB_SD_LIST_JSON_BYTES - off,
-                    "{\"mounted\":true,\"files\":[");
+                    "{\"mounted\":true,\"current\":\"%s\",\"files\":[",
+                    escaped_current);
 
     struct dirent *ent;
 
@@ -277,8 +351,19 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
             continue;
         }
 
-        char path[320];
-        snprintf(path, sizeof(path), "/sdcard/%s", ent->d_name);
+        char path[WEB_SD_PATH_MAX + 1];
+        int path_len = snprintf(path, sizeof(path), "%s/%s", directory_path, ent->d_name);
+        if (path_len < 0 || path_len >= sizeof(path)) {
+            continue;
+        }
+
+        char browse_path[WEB_SD_REL_PATH_MAX + 1];
+        int browse_path_len = current_path[0]
+            ? snprintf(browse_path, sizeof(browse_path), "%s/%s", current_path, ent->d_name)
+            : snprintf(browse_path, sizeof(browse_path), "%s", ent->d_name);
+        if (browse_path_len < 0 || browse_path_len >= sizeof(browse_path)) {
+            continue;
+        }
 
         struct stat st;
         memset(&st, 0, sizeof(st));
@@ -287,14 +372,11 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
             continue;
         }
 
-        if (S_ISDIR(st.st_mode)) {
-            continue;
-        }
-
-        const char *type = "file";
+        bool is_dir = S_ISDIR(st.st_mode);
+        const char *type = is_dir ? "directory" : "file";
         const char *dot = strrchr(ent->d_name, '.');
 
-        if (dot) {
+        if (!is_dir && dot) {
             if (strcasecmp(dot, ".ild") == 0) {
                 type = "ILDA";
             } else if (strcasecmp(dot, ".txt") == 0) {
@@ -305,15 +387,38 @@ static esp_err_t sd_list_get_handler(httpd_req_t *req)
         }
 
         if (count > 0) {
-            off += snprintf(json + off, WEB_SD_LIST_JSON_BYTES - off, ",");
+            if (off + 1 >= WEB_SD_LIST_JSON_BYTES) {
+                break;
+            }
+            json[off++] = ',';
+            json[off] = '\0';
         }
 
-        off += snprintf(json + off, WEB_SD_LIST_JSON_BYTES - off,
-                        "{\"name\":\"%s\",\"path\":\"%s\",\"size\":%lu,\"type\":\"%s\",\"is_dir\":false}",
-                        ent->d_name,
-                        path,
-                        (unsigned long)st.st_size,
-                        type);
+        char escaped_name[512];
+        char escaped_path[WEB_SD_PATH_MAX * 2 + 1];
+        char escaped_browse_path[WEB_SD_REL_PATH_MAX * 2 + 1];
+        char escaped_type[512];
+        char item[1200];
+        json_escape(ent->d_name, escaped_name, sizeof(escaped_name));
+        json_escape(path, escaped_path, sizeof(escaped_path));
+        json_escape(browse_path, escaped_browse_path, sizeof(escaped_browse_path));
+        json_escape(type, escaped_type, sizeof(escaped_type));
+        int item_len = snprintf(item, sizeof(item),
+                                "{\"name\":\"%s\",\"path\":\"%s\",\"browse_path\":\"%s\",\"size\":%lu,\"type\":\"%s\",\"is_dir\":%s}",
+                                escaped_name, escaped_path, escaped_browse_path,
+                                (unsigned long)st.st_size, escaped_type,
+                                is_dir ? "true" : "false");
+        if (item_len < 0 || item_len >= sizeof(item) ||
+            off + (size_t)item_len + 64 >= WEB_SD_LIST_JSON_BYTES) {
+            if (count > 0) {
+                off--;
+                json[off] = '\0';
+            }
+            break;
+        }
+        memcpy(json + off, item, (size_t)item_len);
+        off += (size_t)item_len;
+        json[off] = '\0';
 
         count++;
 
@@ -1117,6 +1222,7 @@ static const char *html_page =
 
 "<section id='playback' class='section'>"
 "<div class='card filesCard'><div class='cardHead'><h3>SD playback</h3><button class='refreshBtn' onclick='loadSdFiles()'>Rescan SD Card</button></div>"
+"<div class='actions' style='padding-top:0'><button id='sdUpBtn' onclick='goSdParent()'>Up</button><span id='sdCurrentPath' class='muted'>/</span></div>"
 "<div class='tableWrap'><table class='sdTable'><thead><tr><th>Name</th><th class='sizeCol'>Size</th><th class='actionCol'>Action</th></tr></thead><tbody id='fileRows'></tbody></table></div>"
 "</div>"
 "</section>"
@@ -1215,7 +1321,7 @@ static const char *html_page =
 "</main></div>"
 
 "<script>"
-"let prev=null;let rates={underruns:0,payload:0,packets:0,bad:0,dropped:0,rxTimeouts:0,sd:0,idn:0,ether:0,ilw:0};let bufDirty=false;let mirrorDirty=false;let lastRpStatus=null;let lastSdSig=null;let diagBase=null;let testColorMask=7;"
+"let prev=null;let rates={underruns:0,payload:0,packets:0,bad:0,dropped:0,rxTimeouts:0,sd:0,idn:0,ether:0,ilw:0};let bufDirty=false;let mirrorDirty=false;let lastRpStatus=null;let lastSdSig=null;let currentSdPath='';let diagBase=null;let testColorMask=7;"
 "function showTab(id,btn){btn=btn||document.querySelector('.nav button[data-tab='+id+']');document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');document.getElementById('crumb').innerText=btn?btn.innerText:id;if(id==='playback')loadSdFiles();if(id==='protocols')loadProtocolSettings();if(id==='network')loadNetworkSettings();}"
 "function post(url){return fetch(url,{method:'POST'}).then(r=>r.text()).then(t=>{console.log(url,t);setTimeout(update,120);return t;});}"
 "function refreshEngine(){return post('/api/scan/refresh');}"
@@ -1256,7 +1362,8 @@ static const char *html_page =
 "function fmtKpps(pps){return (pps/1000).toFixed(0)+' kpps';}"
 "function fmtRate(v){return v>=1000?(v/1000).toFixed(1)+' k/s':v.toFixed(0);}"
 "function fmtBuffer(j){return j.remote_buffer_size_samples?j.remote_buffer_fill_samples+'/'+j.remote_buffer_size_samples:j.remote_buffer_fill_samples;}"
-"function loadSdFiles(){fetch('/api/sd/list').then(r=>r.json()).then(j=>{let body=document.getElementById('fileRows');if(!body)return;body.innerHTML='';if(!j.files)return;j.files.forEach(f=>{if(f.type==='dir'||f.type==='directory'||f.is_dir)return;let tr=document.createElement('tr');let playable=f.name.toLowerCase().endsWith('.ild');tr.innerHTML='<td>'+f.name+'</td><td class=\"sizeCell\">'+fmtBytes(f.size)+'</td><td class=\"actionCell\">'+(playable?'<button class=\"green playBtn\">Play</button>':'<span class=\"muted\">--</span>')+'</td>';if(playable){tr.children[2].querySelector('button').onclick=()=>playIldaPath(f.path);}body.appendChild(tr);});}).catch(e=>{let body=document.getElementById('fileRows');if(body)body.innerHTML='';});}"
+"function goSdParent(){let i=currentSdPath.lastIndexOf('/');loadSdFiles(i<0?'':currentSdPath.slice(0,i));}"
+"function loadSdFiles(path){if(path===undefined)path=currentSdPath;let url='/api/sd/list';if(path)url+='?path='+encodeURIComponent(path);fetch(url).then(r=>r.json()).then(j=>{let body=document.getElementById('fileRows');if(!body)return;body.replaceChildren();currentSdPath=j.current||'';setText('sdCurrentPath','/'+currentSdPath);let up=document.getElementById('sdUpBtn');if(up)up.disabled=!currentSdPath;if(!j.files)return;j.files.forEach(f=>{let tr=document.createElement('tr');let name=document.createElement('td');name.textContent=f.name;tr.appendChild(name);let size=document.createElement('td');size.className='sizeCell';size.textContent=f.is_dir?'--':fmtBytes(f.size);tr.appendChild(size);let action=document.createElement('td');action.className='actionCell';if(f.is_dir){let open=document.createElement('button');open.textContent='Open';open.onclick=()=>loadSdFiles(f.browse_path);action.appendChild(open);}else if(f.name.toLowerCase().endsWith('.ild')){let play=document.createElement('button');play.className='green playBtn';play.textContent='Play';play.onclick=()=>playIldaPath(f.path);action.appendChild(play);}else{action.textContent='--';}tr.appendChild(action);body.appendChild(tr);});}).catch(e=>{let body=document.getElementById('fileRows');if(body)body.replaceChildren();});}"
 "function syncSdFiles(j){let sig=[j.sd_inserted?1:0,j.sd_mounted?1:0,j.sd_file_count||0].join(':');if(sig!==lastSdSig){lastSdSig=sig;loadSdFiles();}}"
 "function syncProtocolRates(){setText('protoRateSd',fmtRate(rates.sd));setText('protoRateIdn',fmtRate(rates.idn));setText('protoRateEther',fmtRate(rates.ether));setText('protoRateIlw',fmtRate(rates.ilw));setText('protoStateSd',rates.sd>0?'Active':'Idle');setText('protoStateIdn',rates.idn>0?'Active':'Idle');setText('protoStateEther',rates.ether>0?'Active':'Idle');setText('protoStateIlw',rates.ilw>0?'Active':'Idle');setClass('protoStateSd',rates.sd>0?'v status-ok':'muted');setClass('protoStateIdn',rates.idn>0?'v status-ok':'muted');setClass('protoStateEther',rates.ether>0?'v status-ok':'muted');setClass('protoStateIlw',rates.ilw>0?'v status-ok':'muted');}"
 "function countFromBase(j,k){let b=diagBase?Number(diagBase[k]||0):0;return Math.max(0,Number(j[k]||0)-b);}"

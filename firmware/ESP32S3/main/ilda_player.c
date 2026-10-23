@@ -228,6 +228,76 @@ static void free_samples(void)
     s_sample_count = 0;
 }
 
+static esp_err_t preflight_ilda(FILE *f, size_t *sample_count)
+{
+    uint8_t discard[256];
+    size_t total_samples = 0;
+    size_t max_samples = PSRAM_LIMIT_BYTES / sizeof(sample_t);
+
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    while (!s_stop) {
+        uint8_t header[32];
+        size_t header_bytes = fread(header, 1, sizeof(header), f);
+        if (header_bytes != sizeof(header)) {
+            if (ferror(f)) {
+                return ESP_FAIL;
+            }
+            if (header_bytes != 0) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            break;
+        }
+
+        if (memcmp(header, "ILDA", 4) != 0) {
+            return ESP_ERR_INVALID_RESPONSE;
+        }
+
+        uint8_t format = header[7];
+        uint16_t records = be16(&header[24]);
+        if (records == 0) {
+            break;
+        }
+
+        int rec_size = record_size_for_format(format);
+        if (rec_size <= 0) {
+            return ESP_ERR_NOT_SUPPORTED;
+        }
+
+        if ((size_t)records > max_samples - total_samples) {
+            ESP_LOGE(TAG, "ILDA exceeds memory limit of %u samples", (unsigned int)max_samples);
+            return ESP_ERR_NO_MEM;
+        }
+
+        total_samples += records;
+        size_t remaining = (size_t)records * (size_t)rec_size;
+        while (remaining > 0) {
+            size_t chunk = remaining < sizeof(discard) ? remaining : sizeof(discard);
+            if (fread(discard, 1, chunk, f) != chunk) {
+                return ESP_ERR_INVALID_SIZE;
+            }
+            remaining -= chunk;
+        }
+
+        taskYIELD();
+    }
+
+    if (s_stop) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (total_samples == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    if (fseek(f, 0, SEEK_SET) != 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    *sample_count = total_samples;
+    return ESP_OK;
+}
+
 static esp_err_t load_ilda_to_psram(const char *path)
 {
     FILE *f = fopen(path, "rb");
@@ -239,10 +309,17 @@ static esp_err_t load_ilda_to_psram(const char *path)
     free_samples();
 
     size_t max_samples = PSRAM_LIMIT_BYTES / sizeof(sample_t);
+    size_t expected_samples = 0;
+    esp_err_t ret = preflight_ilda(f, &expected_samples);
+    if (ret != ESP_OK) {
+        fclose(f);
+        ESP_LOGE(TAG, "ILDA preflight failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
 
-    s_samples = heap_caps_malloc(max_samples * sizeof(sample_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_samples = heap_caps_malloc(expected_samples * sizeof(sample_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_samples) {
-        s_samples = heap_caps_malloc(max_samples * sizeof(sample_t), MALLOC_CAP_8BIT);
+        s_samples = heap_caps_malloc(expected_samples * sizeof(sample_t), MALLOC_CAP_8BIT);
     }
 
     if (!s_samples) {
@@ -291,7 +368,7 @@ static esp_err_t load_ilda_to_psram(const char *path)
                 return ESP_ERR_INVALID_SIZE;
             }
 
-            if (count >= max_samples) {
+            if (count >= expected_samples || count >= max_samples) {
                 fclose(f);
                 free_samples();
                 ESP_LOGE(TAG, "ILDA too large for memory. Max converted samples=%u", (unsigned int)max_samples);
@@ -306,6 +383,18 @@ static esp_err_t load_ilda_to_psram(const char *path)
     }
 
     fclose(f);
+
+    if (s_stop) {
+        free_samples();
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (count != expected_samples) {
+        free_samples();
+        ESP_LOGE(TAG, "ILDA changed while loading: expected %u samples, read %u",
+                 (unsigned int)expected_samples, (unsigned int)count);
+        return ESP_ERR_INVALID_SIZE;
+    }
 
     if (count == 0) {
         free_samples();
