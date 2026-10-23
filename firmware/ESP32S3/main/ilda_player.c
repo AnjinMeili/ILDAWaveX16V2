@@ -769,7 +769,13 @@ static esp_err_t begin_playback(const char *path, size_t expected_samples, uint3
        The file has already passed check_ilda_file(). Only now is the current
        output stopped. A playlist, if given, is handed over to the sender.
     */
-    esp_err_t ret = ilda_player_stop_and_wait(5000);
+    esp_err_t ret = rp_manager_stop_test_stream();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Test pattern did not stop before ILDA start: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = ilda_player_stop_and_wait(5000);
     if (ret != ESP_OK) {
         return ret;
     }

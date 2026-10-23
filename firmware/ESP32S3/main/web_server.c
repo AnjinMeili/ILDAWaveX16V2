@@ -1456,8 +1456,6 @@ static esp_err_t ilda_start_post_handler(httpd_req_t *req)
         return send_bad_request(req, "Invalid SD file path");
     }
 
-    rp_manager_stop_test_stream();
-
     return send_plain_result(req, ilda_player_start(path, scale_percent));
 }
 
@@ -1525,8 +1523,6 @@ static esp_err_t ilda_folder_post_handler(httpd_req_t *req)
     if (path_len < 0 || (size_t)path_len >= sizeof(full_path)) {
         return send_bad_request(req, "SD folder path is too long");
     }
-
-    rp_manager_stop_test_stream();
 
     return send_plain_result(req, ilda_player_start_folder(full_path, recursive,
                                                            hold_s * 1000U,
