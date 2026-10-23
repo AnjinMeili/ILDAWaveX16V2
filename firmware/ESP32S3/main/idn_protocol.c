@@ -547,9 +547,14 @@ static void feed_task(void *arg)
             last = s_feed_stage[i];
         }
 
-        /* Pad remainder with galvo-hold */
-        for (uint32_t i = got; i < (uint32_t)RP_STREAM_SAMPLES_PER_PACKET; i++)
-            memcpy(s_feed_packet[i], last.ch, sizeof(s_feed_packet[i]));
+        /* Hold scanner position through packet gaps, but never repeat light. */
+        for (uint32_t i = got; i < (uint32_t)RP_STREAM_SAMPLES_PER_PACKET; i++) {
+            s_feed_packet[i][0] = last.ch[0];
+            s_feed_packet[i][1] = last.ch[1];
+            for (int ch = 2; ch < RP_SAMPLE_CHANNELS; ch++) {
+                s_feed_packet[i][ch] = -32768;
+            }
+        }
 
         esp_err_t err = rp_manager_send_samples_packet(s_feed_packet);
         if (err == ESP_OK) {
