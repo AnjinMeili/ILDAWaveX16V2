@@ -531,6 +531,27 @@ static void handle_client(int sock)
                 continue;
             }
 
+            /* -- Update point rate -------------------------------------- */
+            /* Same layout as begin; changes the rate during playback without
+             * the queue. Sent by clients such as Modulaser when the operator
+             * changes the rate. */
+            if (cmd == 'u') {
+                ed_begin_cmd_t update;
+                if (!tcp_recv_all(sock, (uint8_t *)&update + 1, sizeof(update) - 1)) break;
+                if (s_pb_state != PB_PREPARED && s_pb_state != PB_PLAYING) {
+                    if (!send_response(sock, RESP_INV, cmd)) break;
+                    continue;
+                }
+                uint32_t rate = update.point_rate;
+                if (rate == 0) rate = ED_DEFAULT_POINT_RATE;
+                if (rate > ED_MAX_POINT_RATE) rate = ED_MAX_POINT_RATE;
+                s_point_rate = rate;
+                rp_manager_set_rate(rate);
+                ESP_LOGI(TAG, "Update @ %lu pps", (unsigned long)rate);
+                if (!send_response(sock, RESP_ACK, cmd)) break;
+                continue;
+            }
+
             /* -- Queue rate change -------------------------------------- */
             if (cmd == 'q') {
                 ed_queue_rate_cmd_t qr;
