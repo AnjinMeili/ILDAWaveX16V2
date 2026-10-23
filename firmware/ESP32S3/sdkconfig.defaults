@@ -15,6 +15,16 @@ CONFIG_LWIP_MAX_ACTIVE_TCP=24
 CONFIG_LWIP_MAX_LISTENING_TCP=16
 CONFIG_LWIP_MAX_UDP_PCBS=24
 
+# Ether Dream streams 18-byte points over TCP. The default 5760-byte window
+# capped ingest near 24 kpps (one window per ~13 ms round trip). The window
+# must stay under the W5500's 16 KB MACRAW RX buffer: a 32 KB window let the
+# sender burst past it, dropped frames and stalled TCP on retransmits.
+# 11520 bytes (8 x 1440 MSS) doubles the old cap and still fits.
+# Larger mailboxes keep bursts of IDN/ILW UDP packets.
+CONFIG_LWIP_TCP_WND_DEFAULT=11520
+CONFIG_LWIP_TCP_RECVMBOX_SIZE=32
+CONFIG_LWIP_UDP_RECVMBOX_SIZE=32
+
 # Task watchdog: don't subscribe idle tasks. Under V1 WiFi-AP mode the LWIP
 # and WiFi tasks (priority 18-23) on CPU0 can legitimately starve IDLE0 during
 # peak UDP traffic. output_task yields every 512 samples via vTaskDelay(1).
