@@ -1421,15 +1421,21 @@ static bool parse_scale_percent(const char *value, uint8_t *scale_percent)
 
 static esp_err_t ilda_start_post_handler(httpd_req_t *req)
 {
-    char query[256];
-    char path[192];
+    char query[WEB_SD_PATH_MAX * 3 + 32];
+    char path[WEB_SD_PATH_MAX * 3 + 1];
     char scale_value[8];
     uint8_t scale_percent = ILDA_SCALE_MAX_PERCENT;
 
     strlcpy(path, "/sdcard/test.ild", sizeof(path));
 
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK) {
-        if (httpd_query_key_value(query, "path", path, sizeof(path)) != ESP_OK) {
+    /* Only a request with no path plays the default file; a cut-off path is an error. */
+    esp_err_t ret = httpd_req_get_url_query_str(req, query, sizeof(query));
+    if (ret == ESP_OK) {
+        ret = httpd_query_key_value(query, "path", path, sizeof(path));
+        if (ret == ESP_ERR_HTTPD_RESULT_TRUNC) {
+            return send_bad_request(req, "SD file path is too long");
+        }
+        if (ret != ESP_OK) {
             strlcpy(path, "/sdcard/test.ild", sizeof(path));
         }
 
@@ -1437,9 +1443,18 @@ static esp_err_t ilda_start_post_handler(httpd_req_t *req)
             !parse_scale_percent(scale_value, &scale_percent)) {
             return send_bad_request(req, "XY scale must be between 10 and 100 percent");
         }
+    } else if (ret == ESP_ERR_HTTPD_RESULT_TRUNC) {
+        return send_bad_request(req, "SD file path is too long");
     }
 
     url_decode_inplace(path);
+
+    size_t mount_len = strlen(SD_MOUNT_POINT);
+    if (strncmp(path, SD_MOUNT_POINT "/", mount_len + 1) != 0 ||
+        path[mount_len + 1] == '\0' ||
+        !valid_sd_relative_path(path + mount_len + 1)) {
+        return send_bad_request(req, "Invalid SD file path");
+    }
 
     rp_manager_stop_test_stream();
 
