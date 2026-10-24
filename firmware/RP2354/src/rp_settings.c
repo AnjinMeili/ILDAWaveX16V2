@@ -14,11 +14,12 @@
 #endif
 
 #define SETTINGS_MAGIC   0x49574442u
-#define SETTINGS_VERSION 2u
+#define SETTINGS_VERSION 3u
 #define SETTINGS_FLASH_OFFSET (PICO_FLASH_SIZE_BYTES - (2 * FLASH_SECTOR_SIZE))
 
 #define MAX_RATE_MIN_HZ 1000u
 #define MAX_RATE_MAX_HZ 200000u
+#define COLOR_SHIFT_MAX_US 2000
 
 /* Version 1 record: no rate limit. Still accepted so an upgrade keeps the
    buffer and mirror settings. */
@@ -34,6 +35,7 @@ typedef struct __attribute__((packed)) {
     uint32_t checksum;
 } settings_record_v1_t;
 
+/* Version 2 record: rate limit, no colour shift. */
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint32_t version;
@@ -45,6 +47,20 @@ typedef struct __attribute__((packed)) {
     uint8_t  _pad[2];
     uint32_t max_rate_hz;
     uint32_t checksum;
+} settings_record_v2_t;
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t buffer_size_samples;
+    uint32_t buffer_high_water_samples;
+    uint32_t buffer_low_water_samples;
+    uint8_t  mirror_x;
+    uint8_t  mirror_y;
+    uint8_t  _pad[2];
+    uint32_t max_rate_hz;
+    int32_t  color_shift_us;
+    uint32_t checksum;
 } settings_record_t;
 
 static rp_settings_t s_settings = {
@@ -54,6 +70,7 @@ static rp_settings_t s_settings = {
     .mirror_x = false,
     .mirror_y = true,
     .max_rate_hz = RP_SETTINGS_DEFAULT_MAX_RATE_HZ,
+    .color_shift_us = 0,
 };
 
 static const uint8_t *s_flash_record_bytes = (const uint8_t *)(XIP_BASE + SETTINGS_FLASH_OFFSET);
@@ -115,6 +132,19 @@ static uint32_t clamp_max_rate(uint32_t value)
     return value;
 }
 
+static int32_t clamp_color_shift(int32_t value)
+{
+    if (value < -COLOR_SHIFT_MAX_US) {
+        return -COLOR_SHIFT_MAX_US;
+    }
+
+    if (value > COLOR_SHIFT_MAX_US) {
+        return COLOR_SHIFT_MAX_US;
+    }
+
+    return value;
+}
+
 static rp_settings_t normalized_settings(const rp_settings_t *in)
 {
     rp_settings_t settings;
@@ -127,6 +157,7 @@ static rp_settings_t normalized_settings(const rp_settings_t *in)
     settings.mirror_x = in->mirror_x;
     settings.mirror_y = in->mirror_y;
     settings.max_rate_hz = clamp_max_rate(in->max_rate_hz);
+    settings.color_shift_us = clamp_color_shift(in->color_shift_us);
 
     return settings;
 }
@@ -151,12 +182,21 @@ static uint32_t record_checksum_v1(const settings_record_v1_t *r)
                            r->buffer_low_water_samples, r->mirror_x, r->mirror_y);
 }
 
-static uint32_t record_checksum(const settings_record_t *r)
+static uint32_t record_checksum_v2(const settings_record_v2_t *r)
 {
     return checksum_fields(r->magic, r->version,
                            r->buffer_size_samples, r->buffer_high_water_samples,
                            r->buffer_low_water_samples, r->mirror_x, r->mirror_y) ^
            (r->max_rate_hz * 0x85ebca6bu);
+}
+
+static uint32_t record_checksum(const settings_record_t *r)
+{
+    return checksum_fields(r->magic, r->version,
+                           r->buffer_size_samples, r->buffer_high_water_samples,
+                           r->buffer_low_water_samples, r->mirror_x, r->mirror_y) ^
+           (r->max_rate_hz * 0x85ebca6bu) ^
+           ((uint32_t)r->color_shift_us * 0xc2b2ae35u);
 }
 
 void rp_settings_load(void)
@@ -168,12 +208,15 @@ void rp_settings_load(void)
         .mirror_x = false,
         .mirror_y = true,
         .max_rate_hz = RP_SETTINGS_DEFAULT_MAX_RATE_HZ,
+        .color_shift_us = 0,
     };
 
     settings_record_t rec;
+    settings_record_v2_t rec2;
     settings_record_v1_t rec1;
 
     memcpy(&rec, s_flash_record_bytes, sizeof(rec));
+    memcpy(&rec2, s_flash_record_bytes, sizeof(rec2));
     memcpy(&rec1, s_flash_record_bytes, sizeof(rec1));
 
     if (rec.magic == SETTINGS_MAGIC &&
@@ -185,6 +228,16 @@ void rp_settings_load(void)
         loaded.mirror_x = rec.mirror_x != 0;
         loaded.mirror_y = rec.mirror_y != 0;
         loaded.max_rate_hz = rec.max_rate_hz;
+        loaded.color_shift_us = rec.color_shift_us;
+    } else if (rec2.magic == SETTINGS_MAGIC &&
+               rec2.version == 2u &&
+               rec2.checksum == record_checksum_v2(&rec2)) {
+        loaded.buffer_size_samples       = rec2.buffer_size_samples;
+        loaded.buffer_high_water_samples = rec2.buffer_high_water_samples;
+        loaded.buffer_low_water_samples  = rec2.buffer_low_water_samples;
+        loaded.mirror_x = rec2.mirror_x != 0;
+        loaded.mirror_y = rec2.mirror_y != 0;
+        loaded.max_rate_hz = rec2.max_rate_hz;
     } else if (rec1.magic == SETTINGS_MAGIC &&
                rec1.version == 1u &&
                rec1.checksum == record_checksum_v1(&rec1)) {
@@ -238,6 +291,7 @@ bool rp_settings_save(const rp_settings_t *settings)
     record.mirror_x                 = s_settings.mirror_x ? 1u : 0u;
     record.mirror_y                 = s_settings.mirror_y ? 1u : 0u;
     record.max_rate_hz              = s_settings.max_rate_hz;
+    record.color_shift_us           = s_settings.color_shift_us;
     record.checksum                 = record_checksum(&record);
 
     memcpy(ctx.page, &record, sizeof(record));

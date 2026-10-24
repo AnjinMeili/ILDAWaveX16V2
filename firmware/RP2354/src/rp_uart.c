@@ -60,6 +60,9 @@ static bool parse_u32_arg(const char *line, const char *key, uint32_t *out)
     return true;
 }
 
+/* A SHIFT applied while running is not in flash until SHIFT save. */
+static bool s_color_shift_unsaved = false;
+
 static void save_current_settings(void)
 {
     rp_settings_t settings;
@@ -69,8 +72,11 @@ static void save_current_settings(void)
     settings.buffer_low_water_samples  = ring_get_low_water();
     output_engine_get_mirror(&settings.mirror_x, &settings.mirror_y);
     settings.max_rate_hz = output_engine_get_max_rate();
+    settings.color_shift_us = output_engine_get_color_shift();
 
-    rp_settings_save(&settings);
+    if (rp_settings_save(&settings)) {
+        s_color_shift_unsaved = false;
+    }
 }
 
 void rp_uart_init(void)
@@ -93,7 +99,7 @@ void uart_send_line(const char *s)
 
 static void send_status(void)
 {
-    char line[512];
+    static char line[640];   /* core 0 only; keeps STATUS off the stack */
 
     stream_rx_status_t rx;
     output_engine_status_t out;
@@ -123,7 +129,10 @@ static void send_status(void)
         "max_lit_step=%lu "
         "lit_big_steps=%lu "
         "blank_big_steps=%lu "
-        "stale_packets=%lu",
+        "stale_packets=%lu "
+        "color_shift_us=%ld "
+        "color_shift_samples=%lu "
+        "color_shift_saved=%lu",
         out.running ? 1ul : 0ul,
         (unsigned long)out.sample_rate_hz,
         (unsigned long)ring_get_fill(),
@@ -144,7 +153,10 @@ static void send_status(void)
         (unsigned long)out.max_lit_step,
         (unsigned long)out.lit_big_steps,
         (unsigned long)out.blank_big_steps,
-        (unsigned long)rx.stream_stale_packets
+        (unsigned long)rx.stream_stale_packets,
+        (long)out.color_shift_us,
+        (unsigned long)out.color_shift_samples,
+        s_color_shift_unsaved ? 0ul : 1ul
     );
 
     uart_send_line(line);
@@ -222,6 +234,45 @@ static void handle_line(char *line)
 
         char reply[48];
         snprintf(reply, sizeof(reply), "OK LIMIT %lu", (unsigned long)out.max_rate_hz);
+        uart_send_line(reply);
+        return;
+    }
+
+    if (strncmp(line, "SHIFT ", 6) == 0) {
+        /*
+           SHIFT color_us=N applies at once; while output runs it is not
+           saved, because a flash write pauses this core mid-stream.
+           SHIFT save writes it, and only while stopped.
+        */
+        output_engine_status_t out;
+        const char *p = strstr(line, "color_us=");
+        bool save = strstr(line, "save") != NULL;
+
+        output_engine_get_status(&out);
+
+        if (save && out.running) {
+            uart_send_line("ERR SHIFT stop output to save");
+            return;
+        }
+
+        if (p) {
+            output_engine_set_color_shift((int32_t)strtol(p + 9, NULL, 10));
+            s_color_shift_unsaved = true;
+        }
+
+        if (!out.running && s_color_shift_unsaved) {
+            save_current_settings();
+        }
+
+        output_engine_get_status(&out);
+        rp_log("command=SHIFT color_us=%ld samples=%lu saved=%u",
+               (long)out.color_shift_us,
+               (unsigned long)out.color_shift_samples,
+               s_color_shift_unsaved ? 0u : 1u);
+
+        char reply[48];
+        snprintf(reply, sizeof(reply), "OK SHIFT %ld saved=%u",
+                 (long)out.color_shift_us, s_color_shift_unsaved ? 0u : 1u);
         uart_send_line(reply);
         return;
     }

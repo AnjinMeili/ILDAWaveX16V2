@@ -18,6 +18,8 @@ typedef struct {
     uint32_t sample_rate_hz;      /* rate actually applied */
     uint32_t requested_rate_hz;   /* last RATE asked for, before the limit */
     uint32_t max_rate_hz;         /* RATE is clamped to this; saved in flash */
+    int32_t  color_shift_us;      /* + delays colours behind X/Y, - advances them */
+    uint32_t color_shift_samples; /* the delay in samples at the current rate */
     uint32_t consumed_samples;
     uint32_t underruns;
     uint32_t failsafe_blank_events;
@@ -43,6 +45,8 @@ void output_engine_resume_after_flash(void);
 void output_engine_set_rate(uint32_t rate_hz);
 void output_engine_set_max_rate(uint32_t max_rate_hz);
 uint32_t output_engine_get_max_rate(void);
+void output_engine_set_color_shift(int32_t shift_us);
+int32_t output_engine_get_color_shift(void);
 void output_engine_set_mirror(bool mirror_x, bool mirror_y);
 void output_engine_get_mirror(bool *mirror_x, bool *mirror_y);
 

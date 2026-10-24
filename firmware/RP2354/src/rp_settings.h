@@ -12,6 +12,7 @@ typedef struct {
     bool mirror_x;
     bool mirror_y;
     uint32_t max_rate_hz;   /* RATE requests above this are clamped */
+    int32_t  color_shift_us; /* colour channels delayed (+) or advanced (-) against X/Y */
 } rp_settings_t;
 
 void rp_settings_load(void);

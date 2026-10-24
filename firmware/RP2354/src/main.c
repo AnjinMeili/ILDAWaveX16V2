@@ -141,6 +141,7 @@ int main(void)
     output_engine_init();
     output_engine_set_mirror(settings.mirror_x, settings.mirror_y);
     output_engine_set_max_rate(settings.max_rate_hz);
+    output_engine_set_color_shift(settings.color_shift_us);
 
     bool startup_logged = false;
 
@@ -152,13 +153,14 @@ int main(void)
     while (true) {
         if (!startup_logged && rp_log_console_connected()) {
             rp_log("boot version=%s watchdog_reset=%u", RP_FW_VERSION, watchdog_reset ? 1u : 0u);
-            rp_log("ready buffer=%lu high_water=%lu low_water=%lu mirror_x=%u mirror_y=%u max_rate=%lu output=PARKED",
+            rp_log("ready buffer=%lu high_water=%lu low_water=%lu mirror_x=%u mirror_y=%u max_rate=%lu color_shift_us=%ld output=PARKED",
                    (unsigned long)ring_get_capacity(),
                    (unsigned long)ring_get_high_water(),
                    (unsigned long)ring_get_low_water(),
                    settings.mirror_x ? 1u : 0u,
                    settings.mirror_y ? 1u : 0u,
-                   (unsigned long)output_engine_get_max_rate());
+                   (unsigned long)output_engine_get_max_rate(),
+                   (long)output_engine_get_color_shift());
             startup_logged = true;
         }
 

@@ -41,6 +41,19 @@
 /* How long STOP waits for the output core to finish its current batch. */
 #define CORE1_IDLE_WAIT_US 50000
 
+/*
+   Colour shift: the scanners lag the commanded position by 100 us or more,
+   the laser does not. Delaying the colour channels by that lag lines the
+   drawn colour up with where the beam really is. Stored in microseconds so
+   the setting survives rate changes; applied as whole samples, up to this
+   many. The history always records the stream, so the delay can change
+   while drawing; it moves one sample per output sample toward the target,
+   which never makes X/Y jump more than one sample along the path.
+*/
+#define COLOR_SHIFT_MAX_US 2000
+#define COLOR_SHIFT_MAX_SAMPLES 128
+#define COLOR_SHIFT_HIST 256   /* power of two, > COLOR_SHIFT_MAX_SAMPLES */
+
 static volatile bool s_running = false;
 static volatile bool s_core1_idle = true;
 static volatile uint32_t s_sample_rate_hz = OUTPUT_DEFAULT_SAMPLE_RATE_HZ;
@@ -54,6 +67,13 @@ static volatile uint32_t s_underruns = 0;
 static volatile uint32_t s_failsafe_blank_events = 0;
 static volatile uint32_t s_mode_transitions = 0;
 static volatile output_engine_mode_t s_output_mode = OUTPUT_MODE_PARKED;
+
+static volatile int32_t s_color_shift_us = 0;
+static volatile uint32_t s_color_shift_samples = 0;   /* |shift| in samples */
+static volatile int32_t s_shift_target = 0;   /* signed samples; set by core 0 */
+static int32_t s_shift_cur = 0;               /* signed samples; core 1 only */
+static int16_t s_shift_hist[COLOR_SHIFT_HIST][RP_SAMPLE_CHANNELS];
+static uint32_t s_shift_pos = 0;
 
 static volatile uint32_t s_max_lit_step = 0;
 static volatile uint32_t s_lit_big_steps = 0;
@@ -322,6 +342,73 @@ static void failsafe_check_no_samples(void)
     }
 }
 
+/* -- Colour shift delay line ------------------------------------------------ */
+
+/* Recompute the target delay in samples from the time and the rate. */
+static void color_shift_update_target(void)
+{
+    int32_t shift_us = s_color_shift_us;
+    uint32_t mag_us = (uint32_t)(shift_us < 0 ? -shift_us : shift_us);
+    uint32_t n = (uint32_t)(((uint64_t)mag_us * s_sample_rate_hz + 500000ULL) / 1000000ULL);
+
+    if (n > COLOR_SHIFT_MAX_SAMPLES) {
+        n = COLOR_SHIFT_MAX_SAMPLES;
+    }
+
+    s_color_shift_samples = n;
+    s_shift_target = shift_us < 0 ? -(int32_t)n : (int32_t)n;
+}
+
+/*
+   Restart the history from `seed` (a pre-mirror sample) at the target
+   delay. Only while core 1 is not applying the shift: before START.
+*/
+static void color_shift_reseed(const int16_t seed[RP_SAMPLE_CHANNELS])
+{
+    for (uint32_t i = 0; i < COLOR_SHIFT_HIST; i++) {
+        memcpy(s_shift_hist[i], seed, RP_SAMPLE_CHANNELS * sizeof(int16_t));
+    }
+
+    s_shift_pos = 0;
+    s_shift_cur = s_shift_target;
+}
+
+/*
+   Apply the colour shift to one output sample, in stream order, before the
+   mirror. Positive shift: X/Y from this sample, colours from n samples ago.
+   Negative shift: colours from this sample, X/Y from n samples ago.
+*/
+static void color_shift_apply(int16_t sample[RP_SAMPLE_CHANNELS])
+{
+    int32_t target = s_shift_target;
+
+    if (s_shift_cur < target) {
+        s_shift_cur++;
+    } else if (s_shift_cur > target) {
+        s_shift_cur--;
+    }
+
+    memcpy(s_shift_hist[s_shift_pos], sample, RP_SAMPLE_CHANNELS * sizeof(int16_t));
+
+    int32_t d = s_shift_cur;
+
+    if (d != 0) {
+        uint32_t n = (uint32_t)(d < 0 ? -d : d);
+        const int16_t *old = s_shift_hist[(s_shift_pos - n) & (COLOR_SHIFT_HIST - 1)];
+
+        if (d > 0) {
+            for (int ch = 2; ch < RP_SAMPLE_CHANNELS; ch++) {
+                sample[ch] = old[ch];
+            }
+        } else {
+            sample[0] = old[0];
+            sample[1] = old[1];
+        }
+    }
+
+    s_shift_pos = (s_shift_pos + 1) & (COLOR_SHIFT_HIST - 1);
+}
+
 /* -- Soft start ------------------------------------------------------------- */
 
 static void preroll_reset(void)
@@ -415,6 +502,7 @@ static void output_one_sample_timed(absolute_time_t *next_time)
     preroll_arm_if_needed();
 
     if (preroll_next(sample)) {
+        color_shift_apply(sample);
         apply_output_mirror(sample);
 
         critical_section_enter_blocking(&s_output_cs);
@@ -428,6 +516,7 @@ static void output_one_sample_timed(absolute_time_t *next_time)
     if (ring_pop(sample)) {
         set_output_mode(OUTPUT_MODE_STREAMING);
         note_valid_sample(sample);
+        color_shift_apply(sample);
         apply_output_mirror(sample);
 
         critical_section_enter_blocking(&s_output_cs);
@@ -443,6 +532,7 @@ static void output_one_sample_timed(absolute_time_t *next_time)
 
         note_output_starved();
         sample_blanked_hold_xy(blanked);
+        color_shift_apply(blanked);
         apply_output_mirror(blanked);
 
         critical_section_enter_blocking(&s_output_cs);
@@ -473,6 +563,7 @@ static void output_preroll_batch(void)
     }
 
     for (i = 0; i < OUTPUT_BATCH_SAMPLES; i++) {
+        color_shift_apply(s_batch[i]);
         apply_output_mirror(s_batch[i]);
     }
 
@@ -506,11 +597,13 @@ static void output_batch(void)
 
     for (uint32_t i = 0; i < got; i++) {
         note_valid_sample(s_batch[i]);
+        color_shift_apply(s_batch[i]);
         apply_output_mirror(s_batch[i]);
     }
 
     for (uint32_t i = got; i < OUTPUT_BATCH_SAMPLES; i++) {
         sample_blanked_hold_xy(s_batch[i]);
+        color_shift_apply(s_batch[i]);
         apply_output_mirror(s_batch[i]);
     }
 
@@ -692,6 +785,12 @@ void output_engine_start(void)
     s_lit_big_steps = 0;
     s_blank_big_steps = 0;
 
+    {
+        int16_t parked[RP_SAMPLE_CHANNELS];
+        sample_parked(parked);
+        color_shift_reseed(parked);
+    }
+
     dac_write_blanked_xy(0, 0);
 
     set_output_mode(OUTPUT_MODE_START_BLANK);
@@ -756,6 +855,9 @@ static void apply_rate_locked_by_limit(void)
 
     s_sample_rate_hz = rate_hz;
     dac_set_sample_rate(rate_hz);
+
+    /* The delay is a time; its length in samples follows the rate. */
+    color_shift_update_target();
 }
 
 void output_engine_set_rate(uint32_t rate_hz)
@@ -781,6 +883,25 @@ void output_engine_set_max_rate(uint32_t max_rate_hz)
 uint32_t output_engine_get_max_rate(void)
 {
     return s_max_rate_hz;
+}
+
+void output_engine_set_color_shift(int32_t shift_us)
+{
+    if (shift_us < -COLOR_SHIFT_MAX_US) {
+        shift_us = -COLOR_SHIFT_MAX_US;
+    }
+
+    if (shift_us > COLOR_SHIFT_MAX_US) {
+        shift_us = COLOR_SHIFT_MAX_US;
+    }
+
+    s_color_shift_us = shift_us;
+    color_shift_update_target();
+}
+
+int32_t output_engine_get_color_shift(void)
+{
+    return s_color_shift_us;
 }
 
 void output_engine_set_mirror(bool mirror_x, bool mirror_y)
@@ -812,6 +933,8 @@ void output_engine_get_status(output_engine_status_t *status)
     status->sample_rate_hz = s_sample_rate_hz;
     status->requested_rate_hz = s_requested_rate_hz;
     status->max_rate_hz = s_max_rate_hz;
+    status->color_shift_us = s_color_shift_us;
+    status->color_shift_samples = s_color_shift_samples;
     status->consumed_samples = s_consumed_samples;
     status->underruns = s_underruns;
     status->failsafe_blank_events = s_failsafe_blank_events;
