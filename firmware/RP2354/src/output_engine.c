@@ -1,4 +1,5 @@
 #include <string.h>
+#include <stdlib.h>
 
 #include "pico/stdlib.h"
 #include "pico/flash.h"
@@ -31,6 +32,12 @@
 #define SOFT_MOVE_MIN_SAMPLES 16
 #define SOFT_MOVE_MAX_SAMPLES 1024
 
+/* Steps of this size or more between consecutive samples are counted. */
+#define BIG_STEP_THRESHOLD 8192
+
+/* Laser channels above this are treated as lit for the step counters. */
+#define LIT_THRESHOLD (INT16_MIN + 2048)
+
 /* How long STOP waits for the output core to finish its current batch. */
 #define CORE1_IDLE_WAIT_US 50000
 
@@ -47,6 +54,10 @@ static volatile uint32_t s_underruns = 0;
 static volatile uint32_t s_failsafe_blank_events = 0;
 static volatile uint32_t s_mode_transitions = 0;
 static volatile output_engine_mode_t s_output_mode = OUTPUT_MODE_PARKED;
+
+static volatile uint32_t s_max_lit_step = 0;
+static volatile uint32_t s_lit_big_steps = 0;
+static volatile uint32_t s_blank_big_steps = 0;
 
 static int16_t s_last_output[RP_SAMPLE_CHANNELS];
 
@@ -239,8 +250,36 @@ static void set_last_output_blanked_hold_xy(void)
     critical_section_exit(&s_output_cs);
 }
 
+static bool sample_is_lit(const int16_t sample[RP_SAMPLE_CHANNELS])
+{
+    for (int i = 2; i <= 5; i++) {
+        if (sample[i] > LIT_THRESHOLD) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 static void note_valid_sample(const int16_t sample[RP_SAMPLE_CHANNELS])
 {
+    if (s_have_valid_xy) {
+        uint32_t dx = (uint32_t)abs((int32_t)sample[0] - (int32_t)s_last_valid_x);
+        uint32_t dy = (uint32_t)abs((int32_t)sample[1] - (int32_t)s_last_valid_y);
+        uint32_t step = dx > dy ? dx : dy;
+
+        if (sample_is_lit(sample)) {
+            if (step > s_max_lit_step) {
+                s_max_lit_step = step;
+            }
+            if (step >= BIG_STEP_THRESHOLD) {
+                s_lit_big_steps++;
+            }
+        } else if (step >= BIG_STEP_THRESHOLD) {
+            s_blank_big_steps++;
+        }
+    }
+
     s_last_valid_x = sample[0];
     s_last_valid_y = sample[1];
     s_have_valid_xy = true;
@@ -649,6 +688,10 @@ void output_engine_start(void)
     s_last_valid_y = 0;
     preroll_reset();
 
+    s_max_lit_step = 0;
+    s_lit_big_steps = 0;
+    s_blank_big_steps = 0;
+
     dac_write_blanked_xy(0, 0);
 
     set_output_mode(OUTPUT_MODE_START_BLANK);
@@ -776,6 +819,9 @@ void output_engine_get_status(output_engine_status_t *status)
     status->mode = s_output_mode;
     status->mirror_x = s_mirror_x;
     status->mirror_y = s_mirror_y;
+    status->max_lit_step = s_max_lit_step;
+    status->lit_big_steps = s_lit_big_steps;
+    status->blank_big_steps = s_blank_big_steps;
 
     memcpy(status->last_output, s_last_output, sizeof(status->last_output));
 

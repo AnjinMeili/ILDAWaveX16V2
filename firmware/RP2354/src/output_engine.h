@@ -26,6 +26,12 @@ typedef struct {
     bool mirror_x;
     bool mirror_y;
     int16_t last_output[RP_SAMPLE_CHANNELS];
+
+    /* Scanner load since START: the largest X/Y step between consecutive lit
+       samples, and how many steps of 1/8 full scale or more were played. */
+    uint32_t max_lit_step;
+    uint32_t lit_big_steps;
+    uint32_t blank_big_steps;
 } output_engine_status_t;
 
 void output_engine_init(void);

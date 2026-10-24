@@ -119,7 +119,10 @@ static void send_status(void)
         "mirror_x=%lu "
         "mirror_y=%lu "
         "max_rate=%lu "
-        "requested_rate=%lu",
+        "requested_rate=%lu "
+        "max_lit_step=%lu "
+        "lit_big_steps=%lu "
+        "blank_big_steps=%lu",
         out.running ? 1ul : 0ul,
         (unsigned long)out.sample_rate_hz,
         (unsigned long)ring_get_fill(),
@@ -136,7 +139,10 @@ static void send_status(void)
         out.mirror_x ? 1ul : 0ul,
         out.mirror_y ? 1ul : 0ul,
         (unsigned long)out.max_rate_hz,
-        (unsigned long)out.requested_rate_hz
+        (unsigned long)out.requested_rate_hz,
+        (unsigned long)out.max_lit_step,
+        (unsigned long)out.lit_big_steps,
+        (unsigned long)out.blank_big_steps
     );
 
     uart_send_line(line);

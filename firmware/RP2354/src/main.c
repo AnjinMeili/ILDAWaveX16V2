@@ -81,7 +81,7 @@ static void log_runtime_changes(void)
     uint32_t dma_words_delta = dma_words - previous_dma_words;
 
     if (output.running || transition_delta > 0 || underrun_delta > 0 || failsafe_delta > 0) {
-        rp_log("output mode=%s transitions=+%lu underrun_samples=+%lu failsafe_blanks=+%lu consumed=%lu packets=%lu fill=%lu dma_words_to_pio_fifo=+%lu commanded_xy=(%d,%d) commanded_laser_channels_blank=%u",
+        rp_log("output mode=%s transitions=+%lu underrun_samples=+%lu failsafe_blanks=+%lu consumed=%lu packets=%lu fill=%lu dma_words_to_pio_fifo=+%lu commanded_xy=(%d,%d) commanded_laser_channels_blank=%u max_lit_step=%lu lit_big_steps=%lu blank_big_steps=%lu",
                output_mode_name(output.mode),
                (unsigned long)transition_delta,
                (unsigned long)underrun_delta,
@@ -92,7 +92,10 @@ static void log_runtime_changes(void)
                (unsigned long)dma_words_delta,
                output.last_output[0],
                output.last_output[1],
-               channels_blanked(output.last_output) ? 1u : 0u);
+               channels_blanked(output.last_output) ? 1u : 0u,
+               (unsigned long)output.max_lit_step,
+               (unsigned long)output.lit_big_steps,
+               (unsigned long)output.blank_big_steps);
     }
 
     uint32_t bad_delta = rx.stream_bad_packets - previous_rx.stream_bad_packets;
