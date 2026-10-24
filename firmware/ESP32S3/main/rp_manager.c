@@ -995,6 +995,21 @@ esp_err_t rp_manager_output_start(void)
     return ret;
 }
 
+/*
+   A packet already on the wire still lands after a STOP or CLEAR sent now,
+   and the next START would play it: let it finish first. Waits in whole
+   ticks, since pdMS_TO_TICKS(1) is 0 at 100 Hz; the TX task gives up on
+   READY after 500 ms.
+*/
+static void wait_payload_tx_idle(void)
+{
+    int64_t deadline_us = esp_timer_get_time() + 600000;
+
+    while (s_payload_tx_busy && esp_timer_get_time() < deadline_us) {
+        vTaskDelay(1);
+    }
+}
+
 esp_err_t rp_manager_output_stop(void)
 {
     s_test_stream_requested = false;
@@ -1007,6 +1022,7 @@ esp_err_t rp_manager_output_stop(void)
 
     if (s_output_ref > 0 && --s_output_ref == 0) {
         payload_queue_reset();
+        wait_payload_tx_idle();
         ret = uart_cmd_locked("STOP", resp, sizeof(resp));
         if (ret == ESP_OK)
             refresh_status_locked();
@@ -1028,6 +1044,7 @@ esp_err_t rp_manager_output_force_stop(void)
     xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
 
     s_output_ref = 0;
+    wait_payload_tx_idle();
     esp_err_t ret = uart_cmd_locked("STOP", resp, sizeof(resp));
     if (ret == ESP_OK) {
         s_status.remote_running = false;
@@ -1053,16 +1070,7 @@ esp_err_t rp_manager_output_discard_unstarted(void)
 
     if (s_output_ref == 0) {
         payload_queue_reset();
-
-        /*
-           A packet already on the wire still lands after a CLEAR sent now;
-           let it finish first. Waits in whole ticks, since pdMS_TO_TICKS(1)
-           is 0 at 100 Hz; the TX task gives up on READY after 500 ms.
-        */
-        int64_t deadline_us = esp_timer_get_time() + 600000;
-        while (s_payload_tx_busy && esp_timer_get_time() < deadline_us) {
-            vTaskDelay(1);
-        }
+        wait_payload_tx_idle();
 
         ret = uart_cmd_locked("CLEAR", resp, sizeof(resp));
         if (ret == ESP_OK)
@@ -1084,6 +1092,7 @@ esp_err_t rp_manager_clear_buffer(void)
 
     xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
 
+    wait_payload_tx_idle();
     esp_err_t ret = uart_cmd_locked("CLEAR", resp, sizeof(resp));
     if (ret == ESP_OK) {
         ret = refresh_status_locked();
