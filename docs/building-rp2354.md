@@ -91,7 +91,7 @@ Compilation/export validation failure returns nonzero without publishing an arti
 - `picotool-info.txt` records picotool's inspection of the UF2 file.
 - `input-sha256.txt`, `build-info.txt`, and `SHA256SUMS` identify inputs, tool versions, and exported contents.
 
-The UF2 inspector verifies block structure, application family, numbering, order, and application ranges against the linker's FLASH region. Compatibility blocks are reported separately rather than mistaken for application code. These checks do not validate the physical device size, analog output, or settings-sector reservation. No browser package, flashing command, or runtime fix is included.
+The UF2 inspector checks block structure, application family, numbering, order, and application addresses against the linker's FLASH region. It reports RP2350-E10 compatibility blocks separately. The build command exports files without flashing the board.
 
 Verify the export on Linux:
 

@@ -143,9 +143,11 @@ The RP2354 should appear as a USB storage drive. Choose either flashing method:
 
 **Mounted drive:** Copy the `.uf2` onto the RP storage drive. It should automatically unmount and reboot into the new firmware.
 
-Browser flashing of this board remains untested. If WebUSB cannot connect or the browser rejects the UF2's address/family, use the mounted-drive method with the original file. No manual address, raw binary conversion, advanced erase, or OTP operation is needed. Settings preservation has not been validated.
+If WebUSB cannot connect, close other USB tools and re-enter the bootloader, or use the mounted-drive method. Use the original UF2 file; no manual address or binary conversion is needed.
 
 After flashing, refresh the ESP web interface and check the RP connection and firmware version. Builds with the same version cannot be distinguished by that version alone.
+
+For firmware that provides USB logs, open the [Web Serial terminal](https://googlechromelabs.github.io/serial-terminal/) in Chrome or Edge, select the RP serial port, and connect at 115200 baud with hardware flow control disabled. The RP must be running normally, with the flasher disconnected.
 
 ---
 
