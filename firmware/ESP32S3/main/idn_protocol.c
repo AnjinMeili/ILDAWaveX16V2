@@ -907,6 +907,12 @@ static void handle_rt_packet(const struct sockaddr_in *from,
         return;
     }
 
+    /* A close with no session open (a repeated close, say) must not open one. */
+    if (!s_client_active && do_close && payload_len == 0) {
+        if (need_ack) send_ack(from, flags, seq, IDNACK_OK);
+        return;
+    }
+
     if (!session_touch(from)) {
         if (need_ack) send_ack(from, flags, seq, IDNACK_OCCUPIED);
         return;
