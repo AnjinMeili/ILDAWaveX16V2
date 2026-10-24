@@ -117,8 +117,6 @@ Select the board version using the Docker builder's `--board-version` option or 
 
 The current layout uses `bootloader/bootloader.bin` at `0x0`, `partition_table/partition-table.bin` at `0x8000`, and `ILDAWaveX16V2-ESP32S3.bin` at `0x10000`. Always use the values from your build's JSON rather than assuming these offsets. The application binary alone is not a complete factory image. A full-chip erase is not required by this procedure and would remove stored settings.
 
-Browser flashing of local build artifacts has not yet been tested on this board.
-
 The ESP32-S3 should normally enter bootloader mode automatically. If flashing does not start:
 
 1. Hold `ESP BOOT`
