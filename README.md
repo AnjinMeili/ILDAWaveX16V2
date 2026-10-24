@@ -243,6 +243,31 @@ Tested with Modulaser over wired Ethernet: about 21,700 points/s get through at 
 
 ---
 
+### Scanner Protection and Tuning
+
+The board treats the scanners as the fragile part. From RP2354 firmware 0.2.0 and ESP32-S3 firmware 0.2.0:
+
+- **Parked idle.** When stopped, X and Y sit at the scanner centre (0 V on the ILDA differential pairs) with every laser channel at 0 V. Earlier firmware parked at DAC code zero, which is -10 V differential, a full-scale corner.
+- **Soft moves.** `STOP` ramps the scanners from their last position to the centre over 10 ms with the laser blanked; `START` ramps from the centre to the first point of the stream the same way, then plays the stream unchanged. No client sees retimed points; the stream starts 10 ms later.
+- **Scanner rate limit.** Every requested rate, from any protocol or the web page, is clamped to a saved limit. The default is 30,000 pps, which any ILDA 30K scanner can do at the test-pattern angle; set it to your scanners' rating at the angle you use. The web page's **Scanner rating** menu fills in 12K, 20K, 30K, 40K or 50K; press **Save limit** to apply it. These ratings are at 8° optical, so use a lower limit for wider scans. The limit is saved on the ESP32-S3 and on the RP2354, which enforces it on its own. Ether Dream clients are told the applied rate and see the limit as `max_point_rate`.
+- **Colour shift.** A colour/blanking delay in microseconds, applied on the RP2354 after the buffer, so it covers every source including SD playback. Positive values delay the colour channels behind the scanner position. It is applied in whole samples (one sample is 33 us at 30 kpps). To set it, run the **Colour Shift** test pattern: white rows, drawn alternately left to right and right to left, cross red, green and blue columns, with a gap where each row crosses a column. Step the shift on the Output Mapping card until every row's gaps sit on the columns, then stop output and press **Save**. Changes made while output runs take effect at once, moving one sample at a time so the scanners never jump, but are only written to RP2354 flash while stopped.
+- **Underrun hold.** When the buffer runs dry the scanners hold position and the laser blanks; the Ether Dream status reports the underflow flag.
+- **Test patterns.** Switching patterns while one runs moves to the new pattern with the laser blanked. **Stop Stream** stops all output, like the top **STOP**, and parks the scanners.
+- **Scanner load counters.** Per stream, the RP2354 counts the largest lit X/Y step and the number of lit and blanked steps of 1/8 full scale or more. A lit single-sample jump across the frame is a step input to the galvos; the counters show whether a source sends them.
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/api/rp/rate_limit?value=<1000-200000>` | POST | Set and save the scanner rate limit (pps) |
+| `/api/rp/set_rate?value=<pps>` | POST | Request a rate; the applied rate is the request clamped to the limit |
+| `/api/rp/color_shift?value=<-2000..2000>` | POST | Apply the colour shift in microseconds; saved at once while output is stopped |
+| `/api/rp/color_shift?save=1` | POST | Save the applied colour shift; refused while output runs |
+
+`/api/rp/status` adds `rate_limit`, `remote_max_rate`, `remote_requested_rate`, `remote_color_shift_us`, `remote_color_shift_samples`, `remote_color_shift_saved`, `remote_max_lit_step`, `remote_lit_big_steps`, `remote_blank_big_steps`, `remote_stale_packets` and per-protocol `stream_*_dropped` counters for points a protocol received but could not queue.
+
+`tools/hwtest.py` exercises these behaviours on a board (rate clamps, stop and cancel paths, underrun hold, overrun, throughput, IDN packet-size loss) and refuses to run while anything is outputting. `tools/ild_inspect.py` reports the largest lit and blanked steps in `.ild` files. `docs/galvo-safety-review.md` has the findings, measurements and the tuning roadmap; `docs/research/` has the background on the hardware, the protocols and ILDA tuning practice.
+
+---
+
 ### RP2354 Diagnostics
 
 When the USB-C cable is connected to the RP2354, it shows up as a USB serial port with a diagnostic log. Messages are prefixed with `[RP]`. Nothing is printed while the port is closed.
@@ -250,7 +275,7 @@ When the USB-C cable is connected to the RP2354, it shows up as a USB serial por
 The log reports:
 
 - Firmware version, whether the last reset came from the watchdog, and the buffer and mirror settings (printed once, when the port is first opened)
-- Every command from the ESP32-S3: `START`, `STOP`, `CLEAR`, `RATE`, `BUFFER`, `MIRROR`
+- Every command from the ESP32-S3: `START`, `STOP`, `CLEAR`, `RATE`, `LIMIT`, `SHIFT`, `BUFFER`, `MIRROR`
 - Once per second while running: output mode, underruns, failsafe blanking, buffer fill, and the last commanded X/Y position
 - Once per second, if any occurred: bad, dropped, or timed-out stream packets
 
@@ -258,8 +283,8 @@ The output engine is always in one of these modes:
 
 | Mode | Meaning |
 | --- | --- |
-| `HARD_ZERO` | Stopped; all DAC channels at raw zero |
-| `START_BLANK` | Started; scanners centered and laser blanked until the first point arrives |
+| `PARKED` | Stopped; scanners at centre, laser channels at 0 V |
+| `START_BLANK` | Started; scanners centred and laser blanked, then ramped to the first point when it arrives |
 | `STREAMING` | Playing received points |
 | `UNDERRUN_BLANK` | Buffer ran dry; scanners hold position, laser blanked |
 | `FAILSAFE_BLANK` | No points for 20 ms; blanking is re-asserted every 5 ms until data returns |
