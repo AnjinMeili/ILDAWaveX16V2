@@ -2,6 +2,8 @@
 
 The ESP builder compiles V1 and V2 firmware without installing ESP-IDF on the host. Run commands from the repository root. See [RP2354 Docker builds](building-rp2354.md) for the separate RP image and its validation limits.
 
+To install exported binaries, follow the README's [ESP32-S3 flashing instructions](../README.md#flashing-esp32-s3), which cover the release installer and custom-build browser flasher.
+
 ## Bash quick start
 
 ```bash

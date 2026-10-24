@@ -106,13 +106,24 @@ If building from source, use the [ESP Docker builder](docs/building.md) or the E
 
 Select the board version using the Docker builder's `--board-version` option or in `firmware/ESP32S3/main/CMakeLists.txt` for an IDE build.
 
-If flashing a released firmware image, use the [web flasher](https://stanleyprojects.com/projects/ildawavex16v2/install/index.html).
+**Released firmware:** Use the project's [release web installer](https://stanleyprojects.com/projects/ildawavex16v2/install/index.html), which provides preset firmware images.
+
+**Local builds:** Use Espressif's [ESP Web Tool](https://espressif.github.io/esptool-js/) in Chrome or Edge:
+
+1. Connect to the board's ESP USB connection, close other serial terminals, and connect to its serial port in the browser.
+2. Open `flasher_args.json` from `dist/esp32-v2/artifacts/` (or `dist/esp32-v1/artifacts/` for V1).
+3. Add a file row for every entry in `flash_files`, selecting the corresponding local binary and entering its hexadecimal address. Paths are relative to the artifact directory; the JSON itself is not a firmware file to upload.
+4. Match the tool's flash mode, frequency, and size to `flash_settings`, then start programming and wait for completion. Reset the ESP if it does not restart automatically.
+
+The current layout uses `bootloader/bootloader.bin` at `0x0`, `partition_table/partition-table.bin` at `0x8000`, and `ILDAWaveX16V2-ESP32S3.bin` at `0x10000`. Always use the values from your build's JSON rather than assuming these offsets. The application binary alone is not a complete factory image. A full-chip erase is not required by this procedure and would remove stored settings.
+
+Browser flashing of local build artifacts has not yet been tested on this board.
 
 The ESP32-S3 should normally enter bootloader mode automatically. If flashing does not start:
 
 1. Hold `ESP BOOT`
 2. Briefly press and release `ESP RST`
-3. Try flashing again
+3. Release `ESP BOOT` and try flashing again
 
 ---
 
