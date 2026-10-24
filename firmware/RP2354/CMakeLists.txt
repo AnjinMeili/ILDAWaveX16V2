@@ -36,6 +36,7 @@ if (EXISTS ${picoVscode})
 endif()
 
 set(PICO_BOARD pico2 CACHE STRING "Board type")
+set(PICO_FLASH_SIZE_BYTES 2097152)
 
 include(pico_sdk_import.cmake)
 
