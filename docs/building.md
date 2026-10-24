@@ -113,7 +113,9 @@ Do not reuse a nonempty output directory. ARM hosts and emulation are not valida
 
 ESP32-S3 is selected explicitly. Existing `sdkconfig.defaults` and board definitions remain authoritative. Dependency resolution must leave `dependencies.lock` byte-for-byte unchanged or export fails.
 
-The image layers cache toolchain installation. Each run starts with a fresh CMake build directory. Optional compiler caching uses a writable directory mounted at `/cache`, separated by ESP target, pinned toolchain version, board variant, and defaults digest. Downloaded components are not persisted in this first slice.
+The image layers cache toolchain installation. Each run starts with a fresh CMake build directory. Optional compiler caching uses a writable directory mounted at `/cache`, separated by ESP target, pinned toolchain version, board variant, and defaults digest. Downloaded components are not persisted between builds.
+
+The builder links the toolchain's `picolibc.specs` into the disposable build directories so ccache can resolve and hash it. Compiler flags and specs contents are unchanged.
 
 For Linux, create `.build-cache/esp32` and add this argument to `docker run`:
 
@@ -133,7 +135,7 @@ Successful output is published as `/out/artifacts` in a single directory rename.
 - `build-info.txt`: source commit/dirty status, input digest, board, target, base digest, tool versions, and builder-script checksum.
 - `SHA256SUMS` covering all other exported files.
 
-The builder verifies referenced flash binaries are nonempty, nonoverlapping, and within the configured flash size. This verifies packaging against the build configuration, not the physical board or settings-preservation behavior. Flashing, browser manifests, merged factory images, and release publication are outside this slice.
+The builder verifies referenced flash binaries are nonempty, nonoverlapping, and within the configured flash size. This verifies packaging against the build configuration, not the physical board or settings-preservation behavior. It does not generate ESP browser manifests or merged factory images, publish releases, or flash hardware.
 
 Compilation or validation failure returns a nonzero status without publishing `artifacts`. The script cleans its own temporary workspace/staging directory on normal exit or error; forced termination may leave an `.export.*` directory in the output mount. Inspect and remove that incomplete directory before retrying. Existing output is never automatically erased. Do not run concurrent exports to the same directory.
 
@@ -143,22 +145,3 @@ On Linux, verify an export with:
 cd dist/esp32-v2/artifacts
 sha256sum --check SHA256SUMS
 ```
-
-## Earlier builder validation
-
-The earlier builder implementation was validated on Linux x64 using image ID `sha256:0713b519650a44da5b3d43fe7ce0f9a418fe92d8963ec20e4e3995dcaad29735`. This record predates the independent upstream branches:
-
-- V1 and V2 built and exported successfully with unchanged dependency lockfiles and read-only source mounts.
-- Exported checksums passed; flash files use generated offsets `0x0`, `0x8000`, and `0x10000` within the configured 4 MB image layout.
-- Default UID/GID 10001 and arbitrary UID/GID 12345 produced correctly owned, readable exports. ESP-IDF logs a harmless username lookup warning for a UID without a passwd entry.
-- A repeat V2 build reused 810 of 812 cacheable compilations (99.75%). A fresh build also succeeded without a mounted cache.
-- An output path containing spaces worked. Invalid board selection and nonempty output were rejected. An intentionally invalid source mounted only inside a test container returned failure and left output empty.
-- Bash syntax, ShellCheck, and whitespace checks passed. Firmware sources and configuration defaults were not changed.
-
-These builds used a dirty development checkout; exported input digests and builder-script checksums identify their actual inputs. Windows host behavior and hardware flashing are not tested here.
-
-The pinned image includes ccache 4.9.1, which does not resolve GCC's implicit `picolibc.specs` search path. The builder links that exact toolchain file into the disposable application and bootloader build directories so ccache can hash it. A fixed container-local workspace keeps debug paths stable between builds. Compiler flags, specs contents, and cache correctness checks remain unchanged.
-
-## Independent branch validation (2026-10-24)
-
-The builders were reintroduced directly on `origin/main` (`245c7b6`), without firmware formatting or source changes. Both root commands, `./tools/build-firmware.sh esp32` and `./tools/build-firmware.sh esp32 --board-version 1`, successfully built their image, compiled the original sources, and exported artifacts. Exported checksums passed for both variants. Bash syntax, ShellCheck, and whitespace checks passed. These runs used a checkout with the new builder files staged; no Windows or hardware validation was performed.

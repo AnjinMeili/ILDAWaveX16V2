@@ -118,12 +118,15 @@ The ESP32-S3 should normally enter bootloader mode automatically. If flashing do
 
 ### Flashing RP2354
 
-If building from source, use the Raspberry Pi Pico extension in VS Code.
+Build with the [RP Docker builder](docs/building-rp2354.md) or the Raspberry Pi Pico extension in VS Code.
+
+For browser flashing with a local UF2, follow the [RP2354 flashing guide](docs/flashing-rp2354.md). It covers pico⚡flash, Chrome/Edge, and the mounted-drive fallback.
 
 If flashing a released firmware image, enter bootloader mode:
 
 1. Hold `RP BOOT`
 2. Briefly press and release `RP RST`
+3. Release `RP BOOT`
 
 The RP2354 should mount as a storage drive.
 

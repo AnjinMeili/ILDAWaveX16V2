@@ -2,7 +2,9 @@
 
 Build the RP firmware in a Linux amd64 container. The image uses Pico SDK 2.2.0, Arm GNU Toolchain 14.2.Rel1, and picotool 2.2.0-a4, matching the recorded project versions. SDK/picotool commits, the Ubuntu base digest, and the compiler archive checksum are pinned in `docker/rp2354/Dockerfile`. Ubuntu package versions remain mutable at image creation time.
 
-This builder preserves the existing `pico2` board selection, Arm secure target, Release configuration, and disabled Helios plugin. Flash size comes from the checked-out firmware's CMake configuration. The separate `fix/rp2354-flash-size` branch sets it to the owner's confirmed 2 MiB; this builder does not override it. Settings-sector reservation and hardware flashing require separate validation.
+This builder preserves the existing `pico2` board selection, Arm secure target, Release configuration, and disabled Helios plugin. Flash size comes from the firmware's CMake configuration; the builder does not override it or reserve settings space.
+
+To install the generated UF2, follow the [RP2354 browser and mounted-drive flashing guide](flashing-rp2354.md).
 
 ## Build the image
 
@@ -41,7 +43,7 @@ docker run --rm --platform linux/amd64 \
     ildawave-rp2354-builder:local
 ```
 
-These manual Docker commands require an empty output directory; the Bash launcher above handles replacement automatically. Each successful run publishes `dist/rp2354/artifacts/`. The image accepts no build arguments; board/platform/plugin choices are deliberately fixed for this slice.
+These manual Docker commands require an empty output directory; the Bash launcher above handles replacement automatically. Each successful run publishes `dist/rp2354/artifacts/`. The image accepts no build arguments; board/platform/plugin choices are fixed.
 
 ## Windows PowerShell 5.1
 
@@ -97,23 +99,3 @@ Verify the export on Linux:
 cd dist/rp2354/artifacts
 sha256sum --check SHA256SUMS
 ```
-
-## Earlier builder validation
-
-The earlier builder implementation was validated on Linux x64 using image ID `sha256:3d702ab2fb576a7ec451e995fb9a2925aa0c6b0955444b099c0daad8860b015b`. This record predates the independent upstream branches and the flash-size correction:
-
-- Clean builds with and without persistent cache succeeded with networking disabled and a read-only checkout.
-- Default UID/GID 10001 and arbitrary UID/GID 12345 builds exported readable artifacts. An output path containing spaces worked.
-- A clean repeat build reused all 81 cacheable compilations.
-- Checksums passed for all exports. The application UF2 uses family `0xe48bff59`, spanning `0x10000000` through `0x1000ab00` exclusive, including final-page padding. The linker reports 4 MB of flash.
-- One separate RP2350-E10 compatibility block targets `0x10ffff00`. It is reported separately from application data and is not evidence of a physical 16 MB device.
-- Invalid arguments and nonempty output were rejected. An intentionally invalid source mounted only in a test container returned failure without exporting artifacts. The UF2 inspector rejected truncated data and application blocks outside supplied flash bounds.
-- Bash syntax, ShellCheck, Node syntax, and whitespace checks passed. Firmware sources, editor blocks, and flash settings were not changed.
-
-Builds used a dirty development checkout; the exported input inventory and script checksums identify their actual inputs. Windows execution and hardware flashing remain untested.
-
-## Independent branch validation (2026-10-24)
-
-The builder was reintroduced directly on `origin/main` (`245c7b6`) without firmware formatting or source changes. The root Bash command built the image, compiled RP firmware, inspected UF2 metadata, and exported artifacts successfully. That independent source baseline still declares 4 MiB through `pico2`.
-
-The separate one-line flash-size fix was also compiled using the existing builder image with networking disabled. Its linker map reports FLASH origin `0x10000000`, length `0x00200000`; application UF2 blocks end at `0x1000ab00` exclusive. The E10 compatibility block remains separate. The fix does not reserve settings space against application growth or establish a settings migration policy. Neither validation involved flashing hardware.
