@@ -139,9 +139,35 @@ The ESP32-S3 can play `.ild` files directly from microSD.
 
 ILDA frames are parsed, converted into X/Y/color/intensity samples, and streamed to the RP2354 through the same SPI payload path used by live protocols.
 
-The current implementation loads converted frames into PSRAM-backed memory, which makes playback fast and stable, but limits the maximum file size that can be played.
+The current implementation loads converted frames into PSRAM-backed memory, which makes playback fast and stable, but limits the maximum file size that can be played. The current limit is 89,600 points in total across all frames.
+
+Before loading, the player scans the whole file to count its points. Files that exceed the limit, use an unsupported format, or are truncated are rejected before the current playback is stopped, so a bad file never interrupts output. Supported formats are 0, 1, 4 and 5. Some exporters write the closing header with the last frame's point count instead of zero; a header with no data after it is accepted as the end of the file.
 
 A future improvement would be continuous batch reading, where only partial chunks of the ILDA file are read, converted, and streamed at a time. This would allow larger files to be played without loading the full converted output into memory.
+
+The **SD playback** page in the web interface can:
+
+- Browse folders on the card
+- Preview an `.ild` file before playing it: frame count, point counts, formats, and whether it fits within the player limit
+- Animate the preview at the current DAC point rate, with up to 256 points drawn per frame and up to 1024 frames
+- Scale the projected X/Y size from 10% to 100% around the center, live during playback
+- Play every `.ild` file in a folder, in name order, repeating until stopped. The operator sets how long single-frame files are held (default 5 s), how many times each animation plays (default 1), and whether subfolders are included. Files that fail the checks are skipped, and the output is blanked while the next file loads.
+
+The same features are available through the REST API:
+
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/api/sd/list?path=<folder>` | GET | List a folder, relative to the card root |
+| `/api/ilda/preview?path=<file>&frame=<n>` | GET | File summary plus one decimated frame |
+| `/api/ilda/preview?path=<file>&all=1` | GET | File summary plus every frame, streamed |
+| `/api/ilda/start?path=<file>&scale=<10-100>` | POST | Start playback at the given X/Y scale |
+| `/api/ilda/scale?value=<10-100>` | POST | Change X/Y scale while playing |
+| `/api/ilda/play_folder?path=<folder>&hold=<1-3600>&plays=<1-1000>&recursive=<0/1>&scale=<10-100>` | POST | Play a folder (hold in seconds) |
+| `/api/ilda/stop` | POST | Stop playback |
+
+Previews are served by a background task, so status and stop requests are never delayed by a large preview.
+
+`/api/rp/status` reports the file being played in `ilda_file` (relative to the card root) and whether folder playback is active in `ilda_folder`.
 
 ---
 
@@ -153,7 +179,11 @@ It supports IDN-Hello discovery, allowing compatible software to find the device
 
 Once connected, incoming IDN real-time stream data is parsed, converted into the internal 8-channel sample format, and forwarded to the RP2354 output engine.
 
-This protocol path works, but still needs optimization at higher point rates.
+If the stream pauses between packets, the scanners hold their last position with all color and intensity channels blanked, so the last colored point is never repeated.
+
+IDN has no flow control: the sender streams at its own pace. The board queues 3,072 points (about 100 ms at 30 kpps) on the RP2354 before output starts, and that queue absorbs gaps in the sender's stream. A gap longer than the queue shows up as blanking. `IDN_FEED_PREBUFFER` in `ESP32S3/main/idn_protocol.c` trades latency against tolerance for sender hiccups.
+
+Tested with Modulaser at 30 kpps over wired Ethernet: no dropped packets, and output keeps pace with the stream.
 
 ---
 
@@ -166,11 +196,45 @@ Implemented features include:
 - UDP discovery
 - TCP control
 - TCP streaming
-- Point-rate configuration
+- Point-rate configuration, including rate changes during playback (`u`)
 - Prepare / start / stop behavior
 - Ether Dream point conversion into the internal 8-channel sample format
 
-This protocol path works, but still needs optimization at higher point rates.
+The client paces itself from the buffer fullness the board reports. The board keeps only a short cushion (3,072 points) on the RP2354 and holds the rest in its 8,192-point Ether Dream buffer, so the reported fullness covers everything not yet played.
+
+How much is queued is the client's choice. If output blanks briefly while the client is busy, raise the client's buffer or latency setting for the DAC.
+
+Tested with Modulaser over wired Ethernet: about 21,700 points/s get through at 22 kpps and about 29,500 at 30 kpps.
+
+---
+
+### RP2354 Diagnostics
+
+When the USB-C cable is connected to the RP2354, it shows up as a USB serial port with a diagnostic log. Messages are prefixed with `[RP]`. Nothing is printed while the port is closed.
+
+The log reports:
+
+- Firmware version, whether the last reset came from the watchdog, and the buffer and mirror settings (printed once, when the port is first opened)
+- Every command from the ESP32-S3: `START`, `STOP`, `CLEAR`, `RATE`, `BUFFER`, `MIRROR`
+- Once per second while running: output mode, underruns, failsafe blanking, buffer fill, and the last commanded X/Y position
+- Once per second, if any occurred: bad, dropped, or timed-out stream packets
+
+The output engine is always in one of these modes:
+
+| Mode | Meaning |
+| --- | --- |
+| `HARD_ZERO` | Stopped; all DAC channels at raw zero |
+| `START_BLANK` | Started; scanners centered and laser blanked until the first point arrives |
+| `STREAMING` | Playing received points |
+| `UNDERRUN_BLANK` | Buffer ran dry; scanners hold position, laser blanked |
+| `FAILSAFE_BLANK` | No points for 20 ms; blanking is re-asserted every 5 ms until data returns |
+
+Two GPIOs on the breakout nets mirror this state for a scope or logic analyzer:
+
+| Pin | Net | High when |
+| --- | --- | --- |
+| GPIO10 | `RP_IO10` | Output engine is started |
+| GPIO11 | `RP_IO11` | Output is blanked or stopped (any mode other than `STREAMING`) |
 
 ---
 

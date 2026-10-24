@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -12,11 +13,39 @@
 #include "rp_uart.h"
 #include "rp_settings.h"
 #include "config.h"
+#include "project_config.h"
+
+#ifndef ENABLE_HELIOS_USB
+#include "pico/stdio_usb.h"
+#endif
 
 #define RP_UART_PORT      uart1
-#define RP_UART_TX_GPIO   4
-#define RP_UART_RX_GPIO   5
+#define RP_UART_TX_GPIO   PIN_RP_UART_TX
+#define RP_UART_RX_GPIO   PIN_RP_UART_RX
 #define RP_UART_BAUD_RATE 921600
+
+bool rp_log_console_connected(void)
+{
+#ifndef ENABLE_HELIOS_USB
+    return stdio_usb_connected();
+#else
+    return false;
+#endif
+}
+
+void rp_log(const char *format, ...)
+{
+    if (!format || !rp_log_console_connected()) {
+        return;
+    }
+
+    va_list args;
+    va_start(args, format);
+    printf("[RP] ");
+    vprintf(format, args);
+    printf("\n");
+    va_end(args);
+}
 
 static bool parse_u32_arg(const char *line, const char *key, uint32_t *out)
 {
@@ -128,18 +157,21 @@ static void handle_line(char *line)
 
     if (strcmp(line, "START") == 0) {
         output_engine_start();
+        rp_log("command=START output=START_BLANK xy=center channels=blank");
         uart_send_line("OK START");
         return;
     }
 
     if (strcmp(line, "STOP") == 0) {
         output_engine_stop_safe();
+        rp_log("command=STOP output=HARD_ZERO all_channels=1");
         uart_send_line("OK STOP");
         return;
     }
 
     if (strcmp(line, "CLEAR") == 0) {
         output_engine_stop_safe();
+        rp_log("command=CLEAR output=HARD_ZERO ring=cleared");
         uart_send_line("OK CLEAR");
         return;
     }
@@ -147,6 +179,13 @@ static void handle_line(char *line)
     if (strncmp(line, "RATE ", 5) == 0) {
         uint32_t rate = (uint32_t)strtoul(&line[5], NULL, 10);
         output_engine_set_rate(rate);
+
+        output_engine_status_t out;
+        output_engine_get_status(&out);
+        rp_log("command=RATE requested=%lu applied=%lu",
+               (unsigned long)rate,
+               (unsigned long)out.sample_rate_hz);
+
         uart_send_line("OK RATE");
         return;
     }
@@ -163,6 +202,11 @@ static void handle_line(char *line)
         output_engine_stop_safe();
         ring_configure(size, high_water, low_water);
         save_current_settings();
+        rp_log("command=BUFFER size=%lu high_water=%lu low_water=%lu output=HARD_ZERO",
+               (unsigned long)ring_get_capacity(),
+               (unsigned long)ring_get_high_water(),
+               (unsigned long)ring_get_low_water());
+
         uart_send_line("OK BUFFER");
         return;
     }
@@ -176,6 +220,10 @@ static void handle_line(char *line)
 
         output_engine_set_mirror(vx != 0, vy != 0);
         save_current_settings();
+        rp_log("command=MIRROR x=%lu y=%lu",
+               (unsigned long)(vx != 0),
+               (unsigned long)(vy != 0));
+
         uart_send_line("OK MIRROR");
         return;
     }

@@ -18,10 +18,14 @@
 #define TARGET_POINT_RATE_HZ         30000u
 #define DAC_SPI_BITRATE_HZ           ((uint32_t)(TARGET_POINT_RATE_HZ * TX_WORDS_PER_POINT * 24u))
 
-#define PIN_DAC_MOSI                 4u
-#define PIN_DAC_MISO                 5u
-#define PIN_DAC_SCK                  6u
-#define PIN_DAC_CS                   7u
+#define PIN_DAC_MISO                 0u
+#define PIN_DAC_CS                   1u
+#define PIN_DAC_SCK                  2u
+#define PIN_DAC_MOSI                 3u
+#define PIN_RP_UART_TX               4u
+#define PIN_RP_UART_RX               5u
+#define PIN_TRACE_OUTPUT_RUNNING     10u
+#define PIN_TRACE_FORCED_BLANK       11u
 
 #define PIN_SPI0_RX                  16u
 #define PIN_SPI0_CSN                 17u
