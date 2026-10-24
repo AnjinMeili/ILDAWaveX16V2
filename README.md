@@ -102,9 +102,9 @@ Each microcontroller must be flashed separately.
 
 ### Flashing ESP32-S3
 
-If building from source, use the ESP-IDF extension in VS Code.
+If building from source, use the [ESP Docker builder](docs/building.md) or the ESP-IDF extension in VS Code.
 
-Before building, choose the target board version in: `ESP32S3/main/CMakeLists.txt`
+Select the board version using the Docker builder's `--board-version` option or in `firmware/ESP32S3/main/CMakeLists.txt` for an IDE build.
 
 If flashing a released firmware image, use the [web flasher](https://stanleyprojects.com/projects/ildawavex16v2/install/index.html).
 
@@ -118,19 +118,23 @@ The ESP32-S3 should normally enter bootloader mode automatically. If flashing do
 
 ### Flashing RP2354
 
-Build with the [RP Docker builder](docs/building-rp2354.md) or the Raspberry Pi Pico extension in VS Code.
+Use a released `.uf2` or build with the [RP Docker builder](docs/building-rp2354.md) or Raspberry Pi Pico extension in VS Code. Docker builds export `dist/rp2354/artifacts/ILDAWaveX16V2-RP2350.uf2`.
 
-For browser flashing with a local UF2, follow the [RP2354 flashing guide](docs/flashing-rp2354.md). It covers pico⚡flash, Chrome/Edge, and the mounted-drive fallback.
-
-If flashing a released firmware image, enter bootloader mode:
+Connect the board's RP USB connection to your computer with a data-capable cable, then enter bootloader mode:
 
 1. Hold `RP BOOT`
-2. Briefly press and release `RP RST`
+2. Briefly press and release `RP RST` while holding `RP BOOT`
 3. Release `RP BOOT`
 
-The RP2354 should mount as a storage drive.
+The RP2354 should appear as a USB storage drive. Choose either flashing method:
 
-Copy the `.uf2` firmware file onto the drive. It will automatically unmount and reboot into the new firmware.
+**Browser:** Open the third-party [pico⚡flash](https://picoflash.org/) in Chrome or Edge. Click **Connect**, select the RP bootloader device, then select the `.uf2` in the **Flash** tab and click **Flash Device**. Keep USB connected until it reports success. If needed, click **Reboot** or press `RP RST` with `RP BOOT` released. See the tool's [platform requirements](https://github.com/piersfinlayson/picoflash).
+
+**Mounted drive:** Copy the `.uf2` onto the RP storage drive. It should automatically unmount and reboot into the new firmware.
+
+Browser flashing of this board remains untested. If WebUSB cannot connect or the browser rejects the UF2's address/family, use the mounted-drive method with the original file. No manual address, raw binary conversion, advanced erase, or OTP operation is needed. Settings preservation has not been validated.
+
+After flashing, refresh the ESP web interface and check the RP connection and firmware version. Builds with the same version cannot be distinguished by that version alone.
 
 ---
 

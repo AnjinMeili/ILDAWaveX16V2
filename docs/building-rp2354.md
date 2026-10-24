@@ -4,7 +4,7 @@ Build the RP firmware in a Linux amd64 container. The image uses Pico SDK 2.2.0,
 
 This builder preserves the existing `pico2` board selection, Arm secure target, Release configuration, and disabled Helios plugin. Flash size comes from the firmware's CMake configuration; the builder does not override it or reserve settings space.
 
-To install the generated UF2, follow the [RP2354 browser and mounted-drive flashing guide](flashing-rp2354.md).
+To install the generated UF2, follow the [RP2354 flashing instructions](../README.md#flashing-rp2354).
 
 ## Build the image
 
