@@ -55,6 +55,7 @@ esp_err_t rp_manager_get_remote_status(void);
 esp_err_t rp_manager_output_start(void);
 esp_err_t rp_manager_output_stop(void);
 esp_err_t rp_manager_output_force_stop(void);
+esp_err_t rp_manager_output_discard_unstarted(void);
 esp_err_t rp_manager_clear_buffer(void);
 esp_err_t rp_manager_set_rate(uint32_t rate_hz);
 esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,

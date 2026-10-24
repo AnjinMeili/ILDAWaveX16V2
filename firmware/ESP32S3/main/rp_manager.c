@@ -904,6 +904,41 @@ esp_err_t rp_manager_output_force_stop(void)
     return ret;
 }
 
+/*
+   Drop samples a producer queued but never STARTed, so the next START does
+   not play them. Does nothing while another producer holds the output,
+   since its samples share the same queue.
+*/
+esp_err_t rp_manager_output_discard_unstarted(void)
+{
+    char resp[128];
+    esp_err_t ret = ESP_OK;
+
+    xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
+
+    if (s_output_ref == 0) {
+        payload_queue_reset();
+
+        /*
+           A packet already on the wire still lands after a CLEAR sent now;
+           let it finish first. Waits in whole ticks, since pdMS_TO_TICKS(1)
+           is 0 at 100 Hz; the TX task gives up on READY after 500 ms.
+        */
+        int64_t deadline_us = esp_timer_get_time() + 600000;
+        while (s_payload_tx_busy && esp_timer_get_time() < deadline_us) {
+            vTaskDelay(1);
+        }
+
+        ret = uart_cmd_locked("CLEAR", resp, sizeof(resp));
+        if (ret == ESP_OK)
+            refresh_status_locked();
+    }
+
+    xSemaphoreGive(s_rp_mutex);
+
+    return ret;
+}
+
 esp_err_t rp_manager_clear_buffer(void)
 {
     char resp[128];

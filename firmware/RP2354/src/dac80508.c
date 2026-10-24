@@ -11,17 +11,14 @@
 #include "dac80508_tx.pio.h"
 
 #include "dac80508.h"
+#include "project_config.h"
 
 /* DAC80508 pins */
-#define DAC_MISO_GPIO 0
-#define DAC_CS_GPIO   1
-#define DAC_SCK_GPIO  2
-#define DAC_MOSI_GPIO 3
-
-#define DAC_REG_SYNC     0x02
-#define DAC_REG_GAIN     0x04
-#define DAC_REG_TRIGGER  0x05
-#define DAC_REG_DAC_BASE 0x08
+#define DAC_MISO_GPIO PIN_DAC_MISO
+#define DAC_CS_GPIO   PIN_DAC_CS
+#define DAC_SCK_GPIO  PIN_DAC_SCK
+#define DAC_MOSI_GPIO PIN_DAC_MOSI
+#define DAC_REG_DAC_BASE DAC_REG_DAC0
 
 #define DAC_CH_X  6
 #define DAC_CH_Y  7
@@ -32,17 +29,29 @@
 #define DAC_CH_U1 1
 #define DAC_CH_U2 0
 
+/*
+   PIO cycles per 24-bit DAC word in dac80508_tx.pio:
+   pull + set + 24 x (out, nop, jmp) + trailing nop.
+*/
+#define DAC_PIO_CYCLES_PER_WORD (1 + 1 + 24 * 3 + 1)
+
 static PIO s_dac_pio = pio1;
 static uint s_dac_sm = 0;
 static uint s_dac_offset = 0;
 static int s_dac_dma_chan = -1;
 
-static uint32_t s_dac_words[DAC_BATCH_MAX_SAMPLES * 9];
+/*
+   Two word buffers: the next batch is built while DMA still feeds the
+   previous one, so the PIO never idles between batches.
+*/
+static uint32_t s_dac_words[2][DAC_BATCH_MAX_SAMPLES * 9];
+static uint32_t s_dac_buf = 0;
 
 static critical_section_t s_dac_cs;
 
 static uint8_t s_active_mask = DAC_DEFAULT_ACTIVE_MASK;
 static uint32_t s_sample_rate_hz = 1000;
+static volatile uint32_t s_dma_words_submitted = 0;
 
 static inline uint16_t signed_to_dac(int16_t v)
 {
@@ -178,7 +187,7 @@ static void dac_apply_timing_locked(void)
     }
 
     uint32_t frames_per_sample = active_channel_count() + 1;
-    double pio_cycles_per_sample = (double)frames_per_sample * 24.0 * 3.0;
+    double pio_cycles_per_sample = (double)frames_per_sample * DAC_PIO_CYCLES_PER_WORD;
     double target_pio_hz = (double)rate * pio_cycles_per_sample;
 
     uint32_t sys_hz = clock_get_hz(clk_sys);
@@ -195,13 +204,25 @@ static void dac_apply_timing_locked(void)
     pio_sm_set_clkdiv(s_dac_pio, s_dac_sm, div);
 }
 
-static void dac_pio_dma_write_words_blocking(const uint32_t *words, uint32_t count)
+static uint32_t *dac_claim_words_locked(void)
+{
+    /*
+       Safe to fill: at most one transfer is in flight, and it reads the
+       other buffer.
+    */
+    uint32_t *words = s_dac_words[s_dac_buf];
+    s_dac_buf ^= 1u;
+    return words;
+}
+
+static void dac_dma_start_locked(const uint32_t *words, uint32_t count)
 {
     if (count == 0) {
         return;
     }
 
-    critical_section_enter_blocking(&s_dac_cs);
+    /* Previous transfer must finish before the channel is reprogrammed. */
+    dma_channel_wait_for_finish_blocking(s_dac_dma_chan);
 
     dma_channel_config cfg = dma_channel_get_default_config(s_dac_dma_chan);
 
@@ -219,6 +240,18 @@ static void dac_pio_dma_write_words_blocking(const uint32_t *words, uint32_t cou
         true
     );
 
+    s_dma_words_submitted += count;
+}
+
+static void dac_pio_dma_write_words_blocking(const uint32_t *words, uint32_t count)
+{
+    if (count == 0) {
+        return;
+    }
+
+    critical_section_enter_blocking(&s_dac_cs);
+
+    dac_dma_start_locked(words, count);
     dma_channel_wait_for_finish_blocking(s_dac_dma_chan);
 
     critical_section_exit(&s_dac_cs);
@@ -267,22 +300,43 @@ uint8_t dac_get_active_mask(void)
     return s_active_mask;
 }
 
+uint32_t dac_get_dma_words_submitted(void)
+{
+    /*
+       Counts words handed to DMA. Lock-free read: an aligned 32-bit load
+       is atomic on Cortex-M33.
+    */
+    return s_dma_words_submitted;
+}
+
 void dac_write_all_zero(void)
 {
-    uint32_t count = dac_build_words_for_all_raw_zero(s_dac_words);
-    dac_pio_dma_write_words_blocking(s_dac_words, count);
+    critical_section_enter_blocking(&s_dac_cs);
+    uint32_t *words = dac_claim_words_locked();
+    uint32_t count = dac_build_words_for_all_raw_zero(words);
+    dac_dma_start_locked(words, count);
+    dma_channel_wait_for_finish_blocking(s_dac_dma_chan);
+    critical_section_exit(&s_dac_cs);
 }
 
 void dac_write_blanked_xy(int16_t x, int16_t y)
 {
-    uint32_t count = dac_build_words_for_blanked_xy(s_dac_words, x, y);
-    dac_pio_dma_write_words_blocking(s_dac_words, count);
+    critical_section_enter_blocking(&s_dac_cs);
+    uint32_t *words = dac_claim_words_locked();
+    uint32_t count = dac_build_words_for_blanked_xy(words, x, y);
+    dac_dma_start_locked(words, count);
+    dma_channel_wait_for_finish_blocking(s_dac_dma_chan);
+    critical_section_exit(&s_dac_cs);
 }
 
 void dac_write_sample(const int16_t sample[RP_SAMPLE_CHANNELS])
 {
-    uint32_t count = dac_build_words_for_sample(s_dac_words, sample);
-    dac_pio_dma_write_words_blocking(s_dac_words, count);
+    critical_section_enter_blocking(&s_dac_cs);
+    uint32_t *words = dac_claim_words_locked();
+    uint32_t count = dac_build_words_for_sample(words, sample);
+    dac_dma_start_locked(words, count);
+    dma_channel_wait_for_finish_blocking(s_dac_dma_chan);
+    critical_section_exit(&s_dac_cs);
 }
 
 void dac_write_sample_batch(const int16_t samples[][RP_SAMPLE_CHANNELS], uint32_t count)
@@ -295,13 +349,19 @@ void dac_write_sample_batch(const int16_t samples[][RP_SAMPLE_CHANNELS], uint32_
         count = DAC_BATCH_MAX_SAMPLES;
     }
 
+    critical_section_enter_blocking(&s_dac_cs);
+
+    uint32_t *words = dac_claim_words_locked();
     uint32_t wi = 0;
 
     for (uint32_t s = 0; s < count; s++) {
-        wi += dac_build_words_for_sample(&s_dac_words[wi], samples[s]);
+        wi += dac_build_words_for_sample(&words[wi], samples[s]);
     }
 
-    dac_pio_dma_write_words_blocking(s_dac_words, wi);
+    /* Returns once queued; the next call builds while this one drains. */
+    dac_dma_start_locked(words, wi);
+
+    critical_section_exit(&s_dac_cs);
 }
 
 void dac_init(void)
