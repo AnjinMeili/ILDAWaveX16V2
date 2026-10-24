@@ -200,6 +200,8 @@ static portMUX_TYPE      s_rp_poll_mux = portMUX_INITIALIZER_UNLOCKED;
 static int64_t           s_rp_poll_us;
 static uint32_t          s_rp_poll_fill;
 static uint32_t          s_rp_poll_sent;
+static uint32_t          s_rp_poll_underruns;         /* last RP underrun count seen */
+static bool              s_rp_poll_underruns_valid;
 static volatile uint32_t s_rp_sent;
 static volatile bool     s_rp_output_started = false;
 static TaskHandle_t      s_rp_poll_task_h = NULL;
@@ -373,6 +375,19 @@ static void rp_poll_task(void *arg)
                 rp_status_t rp = {0};
                 rp_manager_get_status(&rp);
                 rp_snapshot_set(at_us, rp.remote_buffer_fill_samples, s_rp_sent);
+
+                /*
+                   The RP blanked samples because its ring ran dry: report
+                   it in playback_flags as the real DAC does (bit 1), so a
+                   client can see that it fell behind. Cleared by Prepare.
+                */
+                if (s_rp_poll_underruns_valid &&
+                    rp.remote_underruns != s_rp_poll_underruns &&
+                    s_pb_state == PB_PLAYING) {
+                    s_pb_flags |= (1u << 1);
+                }
+                s_rp_poll_underruns = rp.remote_underruns;
+                s_rp_poll_underruns_valid = true;
             }
         }
         vTaskDelay(pdMS_TO_TICKS(ED_RP_POLL_MS));
@@ -393,6 +408,7 @@ static void feed_output_start(uint32_t queued)
     rp_manager_output_start();
     s_rp_sent = 0;
     rp_snapshot_set(esp_timer_get_time(), queued, 0);
+    s_rp_poll_underruns_valid = false;
     s_rp_output_started = true;
     ESP_LOGI(TAG, "RP output started");
 }
@@ -812,8 +828,10 @@ static void handle_client(int sock)
                         }
                     }
                     uint32_t w = ring_write(pt_chunk, chunk);
-                    if (w < chunk)
+                    if (w < chunk) {
                         ESP_LOGW(TAG, "Ring full mid-write (%u/%u)", w, chunk);
+                        protocol_stream_stats_add_dropped(PROTOCOL_STREAM_ETHERDREAM, chunk - w);
+                    }
                     remaining -= chunk;
                 }
 

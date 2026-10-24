@@ -309,6 +309,22 @@ parse_status:
         s_status.remote_requested_rate = v;
     }
 
+    if (parse_u32_key(resp, "max_lit_step=", &v)) {
+        s_status.remote_max_lit_step = v;
+    }
+
+    if (parse_u32_key(resp, "lit_big_steps=", &v)) {
+        s_status.remote_lit_big_steps = v;
+    }
+
+    if (parse_u32_key(resp, "blank_big_steps=", &v)) {
+        s_status.remote_blank_big_steps = v;
+    }
+
+    if (parse_u32_key(resp, "stale_packets=", &v)) {
+        s_status.remote_stale_packets = v;
+    }
+
     s_status.last_error = ESP_OK;
 
     /*

@@ -52,6 +52,10 @@ typedef struct {
     uint32_t rate_limit;              /* ESP32-side limit, saved in NVS */
     uint32_t remote_max_rate;         /* RP's own limit; 0 = RP firmware without one */
     uint32_t remote_requested_rate;   /* last rate asked of the RP before clamping */
+    uint32_t remote_max_lit_step;     /* largest lit X/Y step since START, 0..65535 */
+    uint32_t remote_lit_big_steps;    /* lit steps >= 1/8 full scale since START */
+    uint32_t remote_blank_big_steps;
+    uint32_t remote_stale_packets;
 
     uint32_t remote_stream_packets;
     uint32_t remote_stream_bad_packets;

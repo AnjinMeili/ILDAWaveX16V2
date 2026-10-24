@@ -880,7 +880,11 @@ static void process_wave_chunk(uint8_t ch_id,
 
         uint32_t w = ring_write(burst, n);
         written += w;
-        if (w < n) break;   /* ring full, drop rest of this chunk */
+        if (w < n) {
+            /* Ring full: the rest of this chunk is lost. Count it. */
+            protocol_stream_stats_add_dropped(PROTOCOL_STREAM_IDN, nsamples - s - w);
+            break;
+        }
         s += n;
     }
 

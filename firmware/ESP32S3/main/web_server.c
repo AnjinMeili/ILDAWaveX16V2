@@ -779,6 +779,10 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
             "\"rate_limit\":%lu,"
             "\"remote_max_rate\":%lu,"
             "\"remote_requested_rate\":%lu,"
+            "\"remote_max_lit_step\":%lu,"
+            "\"remote_lit_big_steps\":%lu,"
+            "\"remote_blank_big_steps\":%lu,"
+            "\"remote_stale_packets\":%lu,"
             "\"remote_underruns\":%lu,"
             "\"remote_stream_packets\":%lu,"
             "\"remote_stream_bad_packets\":%lu,"
@@ -791,6 +795,10 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
             "\"stream_idn_samples\":%lu,"
             "\"stream_etherdream_samples\":%lu,"
             "\"stream_ilw_samples\":%lu,"
+            "\"stream_sd_ilda_dropped\":%lu,"
+            "\"stream_idn_dropped\":%lu,"
+            "\"stream_etherdream_dropped\":%lu,"
+            "\"stream_ilw_dropped\":%lu,"
             "\"test_stream_running\":%s,"
             "\"ilda_running\":%s,"
             "\"ilda_file\":\"%s\","
@@ -813,6 +821,10 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
         (unsigned long)rp.rate_limit,
         (unsigned long)rp.remote_max_rate,
         (unsigned long)rp.remote_requested_rate,
+        (unsigned long)rp.remote_max_lit_step,
+        (unsigned long)rp.remote_lit_big_steps,
+        (unsigned long)rp.remote_blank_big_steps,
+        (unsigned long)rp.remote_stale_packets,
         (unsigned long)rp.remote_underruns,
         (unsigned long)rp.remote_stream_packets,
         (unsigned long)rp.remote_stream_bad_packets,
@@ -825,6 +837,10 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
         (unsigned long)streams.idn_samples,
         (unsigned long)streams.etherdream_samples,
         (unsigned long)streams.ilw_samples,
+        (unsigned long)streams.sd_ilda_dropped,
+        (unsigned long)streams.idn_dropped,
+        (unsigned long)streams.etherdream_dropped,
+        (unsigned long)streams.ilw_dropped,
         rp.test_stream_running ? "true" : "false",
         ilda_player_is_running() ? "true" : "false",
         escaped_ilda_file,
@@ -1854,7 +1870,7 @@ static const char *html_page =
 "function setText(id,v){let e=document.getElementById(id);if(e)e.innerText=v;}"
 "function setClass(id,v){let e=document.getElementById(id);if(e)e.className=v;}"
 "function setButtonState(running){}"
-"function diagnosticStatus(j){return {product:j.product,esp_fw:j.esp_fw,rp_fw:j.rp_fw,dac_engine_ready:!!j.initialized,dac_running:!!j.remote_running,sample_rate:j.remote_sample_rate,buffer_fill:j.remote_buffer_fill_samples,buffer_size:j.remote_buffer_size_samples,buffer_high_water:j.remote_buffer_high_water_samples,buffer_low_water:j.remote_buffer_low_water_samples,buffer_max:j.remote_buffer_max_samples,mirror_x:!!j.remote_mirror_x,mirror_y:!!j.remote_mirror_y,rate_limit:j.rate_limit,rp_max_rate:j.remote_max_rate,underruns:j.remote_underruns,payload_errors:j.remote_payload_errors,stream_packets:j.remote_stream_packets,bad_packets:j.remote_stream_bad_packets,dropped_packets:j.remote_stream_dropped_packets,rx_timeouts:j.remote_stream_rx_timeouts,sd_ilda_samples:j.stream_sd_ilda_samples,idn_samples:j.stream_idn_samples,etherdream_samples:j.stream_etherdream_samples,ilw_samples:j.stream_ilw_samples,sd_ilda_running:!!j.ilda_running,test_pattern_running:!!j.test_stream_running};}"
+"function diagnosticStatus(j){return {product:j.product,esp_fw:j.esp_fw,rp_fw:j.rp_fw,dac_engine_ready:!!j.initialized,dac_running:!!j.remote_running,sample_rate:j.remote_sample_rate,buffer_fill:j.remote_buffer_fill_samples,buffer_size:j.remote_buffer_size_samples,buffer_high_water:j.remote_buffer_high_water_samples,buffer_low_water:j.remote_buffer_low_water_samples,buffer_max:j.remote_buffer_max_samples,mirror_x:!!j.remote_mirror_x,mirror_y:!!j.remote_mirror_y,rate_limit:j.rate_limit,rp_max_rate:j.remote_max_rate,max_lit_step:j.remote_max_lit_step,lit_big_steps:j.remote_lit_big_steps,blank_big_steps:j.remote_blank_big_steps,idn_dropped:j.stream_idn_dropped,etherdream_dropped:j.stream_etherdream_dropped,underruns:j.remote_underruns,payload_errors:j.remote_payload_errors,stream_packets:j.remote_stream_packets,bad_packets:j.remote_stream_bad_packets,dropped_packets:j.remote_stream_dropped_packets,rx_timeouts:j.remote_stream_rx_timeouts,sd_ilda_samples:j.stream_sd_ilda_samples,idn_samples:j.stream_idn_samples,etherdream_samples:j.stream_etherdream_samples,ilw_samples:j.stream_ilw_samples,sd_ilda_running:!!j.ilda_running,test_pattern_running:!!j.test_stream_running};}"
 "function syncMirrorFields(j){if(!mirrorDirty){setChecked('mirrorX',!!j.remote_mirror_x);setChecked('mirrorY',!!j.remote_mirror_y);}}"
 "function syncBufferFields(j){let rpMax=Number(j.remote_buffer_max_samples||0);let rpSize=Number(j.remote_buffer_size_samples||0);let rpHigh=Number(j.remote_buffer_high_water_samples||0);let rpLow=Number(j.remote_buffer_low_water_samples||0);let sizeLimit=rpMax||rpSize;let highLimit=rpSize>256?rpSize-256:0;if(rpSize&&!rpHigh)rpHigh=defaultHigh(rpSize);let lowLimit=rpHigh>256?rpHigh-256:0;setText('bufSizeInfo',rpSize?(rpSize+' / '+sizeLimit):'--');setText('bufHighInfo',rpHigh?(rpHigh+' / '+highLimit):'--');setText('bufLowInfo',rpHigh?(rpLow+' / '+lowLimit):'--');if(!bufDirty){setValIfIdle('bufSizeInput',rpSize||'');setValIfIdle('bufHighInput',rpHigh||'');setValIfIdle('bufLowInput',rpLow);}}"
 "function updateBufferMeter(j){let size=Number(j.remote_buffer_size_samples||0);let fill=Number(j.remote_buffer_fill_samples||0);let low=Number(j.remote_buffer_low_water_samples||0);let high=Number(j.remote_buffer_high_water_samples||0);let lf=size?Math.max(0,Math.min(100,low*100/size)):0;let hf=size?Math.max(lf,Math.min(100,high*100/size)):0;let ff=size?Math.max(0,Math.min(100,fill*100/size)):0;let f=document.getElementById('topBufferFill');let lm=document.getElementById('topBufLowMark');let hm=document.getElementById('topBufHighMark');if(f){f.style.width=ff+'%';f.style.background=!size?'rgba(74,163,255,.35)':fill>=high?'rgba(217,155,40,.55)':fill<low?'rgba(29,191,115,.5)':'rgba(74,163,255,.45)';}if(lm)lm.style.left=lf+'%';if(hm)hm.style.left=hf+'%';}"
