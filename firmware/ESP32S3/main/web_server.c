@@ -37,7 +37,7 @@ static QueueHandle_t s_preview_queue = NULL;
 #define WEB_SERVER_TASK_STACK_BYTES 16384
 #define WEB_SD_PATH_MAX 191
 #define WEB_SD_REL_PATH_MAX (WEB_SD_PATH_MAX - sizeof(SD_MOUNT_POINT))
-#define WEB_RP_STATUS_JSON_BYTES 1920
+#define WEB_RP_STATUS_JSON_BYTES 2560
 #define WEB_NETWORK_JSON_BYTES 2048
 #define WEB_PROTOCOL_JSON_BYTES 960
 #define WEB_JSON_CHUNK_BYTES 768
@@ -776,6 +776,9 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
             "\"remote_buffer_max_samples\":%lu,"
             "\"remote_mirror_x\":%s,"
             "\"remote_mirror_y\":%s,"
+            "\"rate_limit\":%lu,"
+            "\"remote_max_rate\":%lu,"
+            "\"remote_requested_rate\":%lu,"
             "\"remote_underruns\":%lu,"
             "\"remote_stream_packets\":%lu,"
             "\"remote_stream_bad_packets\":%lu,"
@@ -807,6 +810,9 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
         (unsigned long)rp.remote_buffer_max_samples,
         rp.remote_mirror_x ? "true" : "false",
         rp.remote_mirror_y ? "true" : "false",
+        (unsigned long)rp.rate_limit,
+        (unsigned long)rp.remote_max_rate,
+        (unsigned long)rp.remote_requested_rate,
         (unsigned long)rp.remote_underruns,
         (unsigned long)rp.remote_stream_packets,
         (unsigned long)rp.remote_stream_bad_packets,
@@ -1296,6 +1302,25 @@ static esp_err_t rp_set_rate_post_handler(httpd_req_t *req)
     return send_plain_result(req, rp_manager_set_rate(rate));
 }
 
+static esp_err_t rp_rate_limit_post_handler(httpd_req_t *req)
+{
+    char query[64];
+    char param[32];
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "value", param, sizeof(param)) != ESP_OK) {
+        return send_bad_request(req, "Scanner rate limit is required");
+    }
+
+    uint32_t limit = (uint32_t)strtoul(param, NULL, 10);
+
+    if (limit < RP_MIN_RATE_LIMIT_HZ || limit > RP_MAX_RATE_LIMIT_HZ) {
+        return send_bad_request(req, "Scanner rate limit must be between 1000 and 200000 pps");
+    }
+
+    return send_plain_result(req, rp_manager_set_rate_limit(limit));
+}
+
 static esp_err_t rp_buffer_config_post_handler(httpd_req_t *req)
 {
     char body[160];
@@ -1620,13 +1645,15 @@ static const char *html_page =
 
 "<div class='card'><h3>DAC Sample Rate</h3><div class='actions'>"
 "<div class='rateGrid'>"
-"<button class='blue' onclick='setRate(10000)'>10 kpps</button>"
-"<button class='blue' onclick='setRate(20000)'>20 kpps</button>"
-"<button class='blue' onclick='setRate(30000)'>30 kpps</button>"
-"<button class='blue' onclick='setRate(60000)'>60 kpps</button>"
-"<button class='blue' onclick='setRate(100000)'>100 kpps</button>"
+"<button class='blue rateBtn' data-rate='10000' onclick='setRate(10000)'>10 kpps</button>"
+"<button class='blue rateBtn' data-rate='20000' onclick='setRate(20000)'>20 kpps</button>"
+"<button class='blue rateBtn' data-rate='30000' onclick='setRate(30000)'>30 kpps</button>"
+"<button class='blue rateBtn' data-rate='40000' onclick='setRate(40000)'>40 kpps</button>"
+"<button class='blue rateBtn' data-rate='50000' onclick='setRate(50000)'>50 kpps</button>"
 "</div>"
 "<div class='inlineForm'><input id='rateInput' type='number' value='30000' min='1' max='200000'><button onclick='setCustomRate()'>Set custom</button></div>"
+"<div class='inlineForm'><label for='rateLimitInput'>Scanner limit (pps)</label><input id='rateLimitInput' type='number' min='1000' max='200000' oninput='rateLimitDirty=true'><button class='green' onclick='saveRateLimit()'>Save limit</button><span id='rateLimitMsg' class='saveMsg'></span></div>"
+"<div class='note' style='padding:8px 0 0'>Every requested rate, from any protocol or this page, is clamped to the scanner limit. Set it to your galvos' rating at the angle you use; 30 kpps suits any ILDA 30K scanner at 8&deg;.</div>"
 "</div></div>"
 
 "<div class='card'><h3>DAC Output Mapping</h3>"
@@ -1759,12 +1786,15 @@ static const char *html_page =
 "</main></div>"
 
 "<script>"
-"let prev=null;let rates={underruns:0,payload:0,packets:0,bad:0,dropped:0,rxTimeouts:0,sd:0,idn:0,ether:0,ilw:0};let bufDirty=false;let mirrorDirty=false;let lastRpStatus=null;let lastSdSig=null;let currentSdPath='';let diagBase=null;let testColorMask=7;"
+"let rateLimitDirty=false;let prev=null;let rates={underruns:0,payload:0,packets:0,bad:0,dropped:0,rxTimeouts:0,sd:0,idn:0,ether:0,ilw:0};let bufDirty=false;let mirrorDirty=false;let lastRpStatus=null;let lastSdSig=null;let currentSdPath='';let diagBase=null;let testColorMask=7;"
 "function showTab(id,btn){btn=btn||document.querySelector('.nav button[data-tab='+id+']');document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');document.getElementById('crumb').innerText=btn?btn.innerText:id;if(id==='playback')loadSdFiles();if(id==='protocols')loadProtocolSettings();if(id==='network')loadNetworkSettings();}"
 "function post(url){return fetch(url,{method:'POST'}).then(r=>r.text()).then(t=>{console.log(url,t);setTimeout(update,120);return t;});}"
 "function refreshEngine(){return post('/api/scan/refresh');}"
 "function stopAll(){return post('/api/rp/stop');}"
 "function setRate(r){return post('/api/rp/set_rate?value='+encodeURIComponent(r));}"
+"function setRateLimitMsg(t,kind){let e=document.getElementById('rateLimitMsg');if(e){e.innerText=t;e.className='saveMsg '+(kind||'');}}"
+"function saveRateLimit(){let lim=Number(val('rateLimitInput'));if(!Number.isInteger(lim)||lim<1000||lim>200000){setRateLimitMsg('Enter a limit between 1000 and 200000 pps','err');return;}setRateLimitMsg('Saving...','ok');return fetch('/api/rp/rate_limit?value='+lim,{method:'POST'}).then(r=>r.text().then(t=>{if(!r.ok||!t.startsWith('OK')){throw new Error(t.startsWith('ERR ')?t.substring(4):t);}rateLimitDirty=false;setRateLimitMsg('Saved and applied.','ok');setTimeout(update,120);return t;})).catch(e=>setRateLimitMsg(e.message||'Save failed','err'));}"
+"function syncRateLimit(j){let lim=Number(j.rate_limit||0);document.querySelectorAll('.rateBtn').forEach(b=>{b.disabled=lim>0&&Number(b.dataset.rate)>lim;});if(!rateLimitDirty)setValIfIdle('rateLimitInput',lim||'');let msg=document.getElementById('rateLimitMsg');if(msg&&!rateLimitDirty&&!msg.innerText.startsWith('Saved')&&msg.className.indexOf('err')<0){msg.innerText=lim?('Active: '+fmtKpps(lim)+(j.remote_max_rate?' (DAC Engine '+fmtKpps(j.remote_max_rate)+')':' (DAC Engine firmware has no limit of its own)')):'';}}"
 "function setCustomRate(){setRate(document.getElementById('rateInput').value);}"
 "function syncTestColorButtons(){['testRedBtn','testGreenBtn','testBlueBtn','testBlackBtn'].forEach(id=>{let e=document.getElementById(id);if(e)e.classList.remove('active');});let r=document.getElementById('testRedBtn');let g=document.getElementById('testGreenBtn');let b=document.getElementById('testBlueBtn');let k=document.getElementById('testBlackBtn');if((testColorMask&1)&&r)r.classList.add('active');if((testColorMask&2)&&g)g.classList.add('active');if((testColorMask&4)&&b)b.classList.add('active');if(testColorMask===0&&k)k.classList.add('active');}"
 "function sendTestColor(){syncTestColorButtons();return post('/api/rp/test_color?mask='+encodeURIComponent(testColorMask));}"
@@ -1824,11 +1854,11 @@ static const char *html_page =
 "function setText(id,v){let e=document.getElementById(id);if(e)e.innerText=v;}"
 "function setClass(id,v){let e=document.getElementById(id);if(e)e.className=v;}"
 "function setButtonState(running){}"
-"function diagnosticStatus(j){return {product:j.product,esp_fw:j.esp_fw,rp_fw:j.rp_fw,dac_engine_ready:!!j.initialized,dac_running:!!j.remote_running,sample_rate:j.remote_sample_rate,buffer_fill:j.remote_buffer_fill_samples,buffer_size:j.remote_buffer_size_samples,buffer_high_water:j.remote_buffer_high_water_samples,buffer_low_water:j.remote_buffer_low_water_samples,buffer_max:j.remote_buffer_max_samples,mirror_x:!!j.remote_mirror_x,mirror_y:!!j.remote_mirror_y,underruns:j.remote_underruns,payload_errors:j.remote_payload_errors,stream_packets:j.remote_stream_packets,bad_packets:j.remote_stream_bad_packets,dropped_packets:j.remote_stream_dropped_packets,rx_timeouts:j.remote_stream_rx_timeouts,sd_ilda_samples:j.stream_sd_ilda_samples,idn_samples:j.stream_idn_samples,etherdream_samples:j.stream_etherdream_samples,ilw_samples:j.stream_ilw_samples,sd_ilda_running:!!j.ilda_running,test_pattern_running:!!j.test_stream_running};}"
+"function diagnosticStatus(j){return {product:j.product,esp_fw:j.esp_fw,rp_fw:j.rp_fw,dac_engine_ready:!!j.initialized,dac_running:!!j.remote_running,sample_rate:j.remote_sample_rate,buffer_fill:j.remote_buffer_fill_samples,buffer_size:j.remote_buffer_size_samples,buffer_high_water:j.remote_buffer_high_water_samples,buffer_low_water:j.remote_buffer_low_water_samples,buffer_max:j.remote_buffer_max_samples,mirror_x:!!j.remote_mirror_x,mirror_y:!!j.remote_mirror_y,rate_limit:j.rate_limit,rp_max_rate:j.remote_max_rate,underruns:j.remote_underruns,payload_errors:j.remote_payload_errors,stream_packets:j.remote_stream_packets,bad_packets:j.remote_stream_bad_packets,dropped_packets:j.remote_stream_dropped_packets,rx_timeouts:j.remote_stream_rx_timeouts,sd_ilda_samples:j.stream_sd_ilda_samples,idn_samples:j.stream_idn_samples,etherdream_samples:j.stream_etherdream_samples,ilw_samples:j.stream_ilw_samples,sd_ilda_running:!!j.ilda_running,test_pattern_running:!!j.test_stream_running};}"
 "function syncMirrorFields(j){if(!mirrorDirty){setChecked('mirrorX',!!j.remote_mirror_x);setChecked('mirrorY',!!j.remote_mirror_y);}}"
 "function syncBufferFields(j){let rpMax=Number(j.remote_buffer_max_samples||0);let rpSize=Number(j.remote_buffer_size_samples||0);let rpHigh=Number(j.remote_buffer_high_water_samples||0);let rpLow=Number(j.remote_buffer_low_water_samples||0);let sizeLimit=rpMax||rpSize;let highLimit=rpSize>256?rpSize-256:0;if(rpSize&&!rpHigh)rpHigh=defaultHigh(rpSize);let lowLimit=rpHigh>256?rpHigh-256:0;setText('bufSizeInfo',rpSize?(rpSize+' / '+sizeLimit):'--');setText('bufHighInfo',rpHigh?(rpHigh+' / '+highLimit):'--');setText('bufLowInfo',rpHigh?(rpLow+' / '+lowLimit):'--');if(!bufDirty){setValIfIdle('bufSizeInput',rpSize||'');setValIfIdle('bufHighInput',rpHigh||'');setValIfIdle('bufLowInput',rpLow);}}"
 "function updateBufferMeter(j){let size=Number(j.remote_buffer_size_samples||0);let fill=Number(j.remote_buffer_fill_samples||0);let low=Number(j.remote_buffer_low_water_samples||0);let high=Number(j.remote_buffer_high_water_samples||0);let lf=size?Math.max(0,Math.min(100,low*100/size)):0;let hf=size?Math.max(lf,Math.min(100,high*100/size)):0;let ff=size?Math.max(0,Math.min(100,fill*100/size)):0;let f=document.getElementById('topBufferFill');let lm=document.getElementById('topBufLowMark');let hm=document.getElementById('topBufHighMark');if(f){f.style.width=ff+'%';f.style.background=!size?'rgba(74,163,255,.35)':fill>=high?'rgba(217,155,40,.55)':fill<low?'rgba(29,191,115,.5)':'rgba(74,163,255,.45)';}if(lm)lm.style.left=lf+'%';if(hm)hm.style.left=hf+'%';}"
-"function render(j){lastRpStatus=j;calcRates(j);setButtonState(j.remote_running);syncBufferFields(j);syncMirrorFields(j);syncSdFiles(j);syncProtocolRates();syncDiagnosticTotals(j);updateBufferMeter(j);let dacEngineOk=!!j.initialized;let dacRun=!!j.remote_running;let bufferText=fmtBuffer(j);if(j.product)document.title=j.product;setText('brandName',j.product);setText('aboutEspFw',j.esp_fw);setText('aboutRpFw',j.rp_fw);setText('topRate',fmtKpps(j.remote_sample_rate));setText('topFill',bufferText);setClass('topConn',dacEngineOk?'topItem ok':'topItem bad');setClass('topState',dacRun?'topItem ok':'topItem bad');setText('dashUnderrunRate',rates.underruns.toFixed(1));setText('dashPayloadRate',rates.payload.toFixed(1));setClass('dashUnderrunRate',rates.underruns>0?'v status-warn':'v status-ok');setClass('dashPayloadRate',rates.payload>0?'v status-bad':'v status-ok');document.getElementById('status').innerText=JSON.stringify(diagnosticStatus(j),null,2);}"
+"function render(j){lastRpStatus=j;calcRates(j);setButtonState(j.remote_running);syncBufferFields(j);syncMirrorFields(j);syncRateLimit(j);syncSdFiles(j);syncProtocolRates();syncDiagnosticTotals(j);updateBufferMeter(j);let dacEngineOk=!!j.initialized;let dacRun=!!j.remote_running;let bufferText=fmtBuffer(j);if(j.product)document.title=j.product;setText('brandName',j.product);setText('aboutEspFw',j.esp_fw);setText('aboutRpFw',j.rp_fw);setText('topRate',fmtKpps(j.remote_sample_rate));setText('topFill',bufferText);setClass('topConn',dacEngineOk?'topItem ok':'topItem bad');setClass('topState',dacRun?'topItem ok':'topItem bad');setText('dashUnderrunRate',rates.underruns.toFixed(1));setText('dashPayloadRate',rates.payload.toFixed(1));setClass('dashUnderrunRate',rates.underruns>0?'v status-warn':'v status-ok');setClass('dashPayloadRate',rates.payload>0?'v status-bad':'v status-ok');document.getElementById('status').innerText=JSON.stringify(diagnosticStatus(j),null,2);}"
 "function update(){fetch('/api/rp/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{render(j);followPlayer(j);syncPreviewProjectControls(j);}).catch(e=>{setClass('topConn','topItem bad');});}"
 "let previewFrames=[];"
 "function showPreviewFrame(frame){if(frame<0||frame>=previewFrameCount)return;previewFrame=frame;let current=previewFrames[frame];previewFramePoints=Number(current.point_count)||0;setText('previewFrameLabel','Frame '+(frame+1)+' / '+previewFrameCount);setText('previewSelectedPoints',previewFramePoints.toLocaleString());document.getElementById('previewPrevBtn').disabled=frame===0;document.getElementById('previewNextBtn').disabled=frame+1>=previewFrameCount;document.getElementById('previewPlayBtn').disabled=previewFrameCount<2;drawIldaPreview(current.points||[]);}"
@@ -1941,6 +1971,7 @@ esp_err_t web_server_start(void)
     ESP_ERROR_CHECK(register_handler("/api/rp/test_color", HTTP_POST, rp_test_color_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/stop_test_stream", HTTP_POST, rp_stop_stream_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/set_rate", HTTP_POST, rp_set_rate_post_handler));
+    ESP_ERROR_CHECK(register_handler("/api/rp/rate_limit", HTTP_POST, rp_rate_limit_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/buffer_config", HTTP_POST, rp_buffer_config_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/mirror_config", HTTP_POST, rp_mirror_config_post_handler));
 

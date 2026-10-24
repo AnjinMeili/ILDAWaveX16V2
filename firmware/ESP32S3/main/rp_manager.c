@@ -17,6 +17,8 @@
 #include "esp_heap_caps.h"
 #include "driver/gpio.h"
 
+#include "nvs.h"
+
 #include "app_config.h"
 #include "rp_manager.h"
 #include "rp_uart.h"
@@ -53,9 +55,62 @@ static rp_status_t s_status = {
     .initialized = false,
     .remote_sample_rate = 1000,
     .remote_mirror_y = true,
+    .rate_limit = RP_DEFAULT_RATE_LIMIT_HZ,
     .last_error = ESP_OK,
     .remote_fw_version = "unknown",
 };
+
+static const char *RP_NVS_NAMESPACE = "rpcfg";
+static const char *RP_NVS_RATE_LIMIT_KEY = "rate_limit";
+
+static uint32_t clamp_rate_limit(uint32_t limit_hz)
+{
+    if (limit_hz < RP_MIN_RATE_LIMIT_HZ) {
+        return RP_MIN_RATE_LIMIT_HZ;
+    }
+
+    if (limit_hz > RP_MAX_RATE_LIMIT_HZ) {
+        return RP_MAX_RATE_LIMIT_HZ;
+    }
+
+    return limit_hz;
+}
+
+static void rate_limit_load(void)
+{
+    nvs_handle_t nvs;
+    uint32_t value = 0;
+
+    s_status.rate_limit = RP_DEFAULT_RATE_LIMIT_HZ;
+
+    if (nvs_open(RP_NVS_NAMESPACE, NVS_READONLY, &nvs) != ESP_OK) {
+        return;
+    }
+
+    if (nvs_get_u32(nvs, RP_NVS_RATE_LIMIT_KEY, &value) == ESP_OK) {
+        s_status.rate_limit = clamp_rate_limit(value);
+    }
+
+    nvs_close(nvs);
+}
+
+static esp_err_t rate_limit_save(uint32_t limit_hz)
+{
+    nvs_handle_t nvs;
+
+    esp_err_t ret = nvs_open(RP_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = nvs_set_u32(nvs, RP_NVS_RATE_LIMIT_KEY, limit_hz);
+    if (ret == ESP_OK) {
+        ret = nvs_commit(nvs);
+    }
+
+    nvs_close(nvs);
+    return ret;
+}
 
 typedef struct {
     uint8_t *packet;
@@ -159,6 +214,8 @@ static void refresh_version_locked(void)
     }
 }
 
+static esp_err_t push_rate_limit_locked(uint32_t limit_hz);
+
 static esp_err_t refresh_status_locked(void)
 {
     char resp[512];
@@ -243,7 +300,59 @@ parse_status:
         s_status.remote_stream_rx_timeouts = v;
     }
 
+    /* RP firmware 0.2.0 and later. Older firmware leaves these at 0. */
+    if (parse_u32_key(resp, "max_rate=", &v)) {
+        s_status.remote_max_rate = v;
+    }
+
+    if (parse_u32_key(resp, "requested_rate=", &v)) {
+        s_status.remote_requested_rate = v;
+    }
+
     s_status.last_error = ESP_OK;
+
+    /*
+       An RP that rebooted on its own (reflash, watchdog) comes back with the
+       limit from its flash, which may be older than the ESP32's. Push ours
+       again whenever they disagree; the RP saves it, so this happens once.
+    */
+    if (s_status.remote_max_rate != 0 && s_status.remote_max_rate != s_status.rate_limit) {
+        ESP_LOGW(TAG, "RP rate limit %lu differs from %lu; re-syncing",
+                 (unsigned long)s_status.remote_max_rate,
+                 (unsigned long)s_status.rate_limit);
+        push_rate_limit_locked(s_status.rate_limit);
+    }
+
+    return ESP_OK;
+}
+
+/*
+   Push the ESP32's limit to an RP that supports LIMIT, so the RP enforces it
+   on its own as well. Returns ESP_ERR_NOT_SUPPORTED for older RP firmware.
+*/
+static esp_err_t push_rate_limit_locked(uint32_t limit_hz)
+{
+    char cmd[64];
+    char resp[128];
+
+    snprintf(cmd, sizeof(cmd), "LIMIT max_rate=%lu", (unsigned long)limit_hz);
+
+    esp_err_t ret = uart_cmd_locked_timeout(cmd, resp, sizeof(resp), RP_CONFIG_CMD_TIMEOUT_MS);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    if (strncmp(resp, "OK LIMIT", 8) != 0) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    uint32_t v = 0;
+    if (sscanf(resp + 8, "%lu", (unsigned long *)&v) == 1) {
+        s_status.remote_max_rate = v;
+    } else {
+        s_status.remote_max_rate = limit_hz;
+    }
+
     return ESP_OK;
 }
 
@@ -766,6 +875,7 @@ esp_err_t rp_manager_start(void)
     char resp[128];
 
     s_output_ref = 0;
+    rate_limit_load();
 
     xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
 
@@ -777,6 +887,31 @@ esp_err_t rp_manager_start(void)
         refresh_version_locked();
 
         ret = refresh_status_locked();
+
+        /* The ESP32's saved limit is the one the user set; keep the RP in step. */
+        if (ret == ESP_OK && s_status.remote_max_rate != 0 &&
+            s_status.remote_max_rate != s_status.rate_limit) {
+            esp_err_t lim_ret = push_rate_limit_locked(s_status.rate_limit);
+            ESP_LOGI(TAG, "RP rate limit %lu -> %lu: %s",
+                     (unsigned long)s_status.remote_max_rate,
+                     (unsigned long)s_status.rate_limit,
+                     esp_err_to_name(lim_ret));
+        }
+        ESP_LOGI(TAG, "Scanner rate limit %lu pps (RP limit %lu)",
+                 (unsigned long)s_status.rate_limit,
+                 (unsigned long)s_status.remote_max_rate);
+
+        /* The RP keeps its last rate across an ESP32 reboot; pull it under the limit. */
+        if (ret == ESP_OK && s_status.remote_sample_rate > s_status.rate_limit) {
+            char rate_cmd[64];
+            snprintf(rate_cmd, sizeof(rate_cmd), "RATE %lu", (unsigned long)s_status.rate_limit);
+            if (uart_cmd_locked(rate_cmd, resp, sizeof(resp)) == ESP_OK) {
+                ESP_LOGW(TAG, "RP rate %lu above limit at boot; set to %lu",
+                         (unsigned long)s_status.remote_sample_rate,
+                         (unsigned long)s_status.rate_limit);
+                s_status.remote_sample_rate = s_status.rate_limit;
+            }
+        }
     } else {
         ESP_LOGW(TAG, "RP not ready or bad ping response: '%s'", resp);
         s_status.initialized = false;
@@ -959,7 +1094,7 @@ esp_err_t rp_manager_clear_buffer(void)
     return ret;
 }
 
-esp_err_t rp_manager_set_rate(uint32_t rate_hz)
+esp_err_t rp_manager_set_rate_applied(uint32_t rate_hz, uint32_t *applied)
 {
     char cmd[64];
     char resp[128];
@@ -968,8 +1103,14 @@ esp_err_t rp_manager_set_rate(uint32_t rate_hz)
         rate_hz = 1;
     }
 
-    if (rate_hz > 200000) {
-        rate_hz = 200000;
+    if (rate_hz > s_status.rate_limit) {
+        ESP_LOGW(TAG, "Rate %lu above scanner limit %lu; clamped",
+                 (unsigned long)rate_hz, (unsigned long)s_status.rate_limit);
+        rate_hz = s_status.rate_limit;
+    }
+
+    if (rate_hz > RP_MAX_RATE_LIMIT_HZ) {
+        rate_hz = RP_MAX_RATE_LIMIT_HZ;
     }
 
     snprintf(cmd, sizeof(cmd), "RATE %lu", (unsigned long)rate_hz);
@@ -978,12 +1119,58 @@ esp_err_t rp_manager_set_rate(uint32_t rate_hz)
 
     esp_err_t ret = uart_cmd_locked(cmd, resp, sizeof(resp));
     if (ret == ESP_OK) {
+        /* RP 0.2.0+ answers "OK RATE <applied>"; older firmware just "OK RATE". */
+        uint32_t v = 0;
+        if (strncmp(resp, "OK RATE ", 8) == 0 && sscanf(resp + 8, "%lu", (unsigned long *)&v) == 1 && v > 0) {
+            rate_hz = v;
+        }
         s_status.remote_sample_rate = rate_hz;
+        s_status.remote_requested_rate = rate_hz;
     }
 
     xSemaphoreGive(s_rp_mutex);
 
+    if (applied) {
+        *applied = s_status.remote_sample_rate;
+    }
+
     return ret;
+}
+
+esp_err_t rp_manager_set_rate(uint32_t rate_hz)
+{
+    return rp_manager_set_rate_applied(rate_hz, NULL);
+}
+
+uint32_t rp_manager_get_rate_limit(void)
+{
+    return s_status.rate_limit;
+}
+
+esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz)
+{
+    limit_hz = clamp_rate_limit(limit_hz);
+
+    esp_err_t ret = rate_limit_save(limit_hz);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Rate limit not saved: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
+    s_status.rate_limit = limit_hz;
+    esp_err_t push_ret = push_rate_limit_locked(limit_hz);
+    xSemaphoreGive(s_rp_mutex);
+
+    ESP_LOGI(TAG, "Scanner rate limit set to %lu pps (RP: %s)",
+             (unsigned long)limit_hz, esp_err_to_name(push_ret));
+
+    /* A rate already above the new limit is pulled down now. */
+    if (s_status.remote_sample_rate > limit_hz) {
+        rp_manager_set_rate(limit_hz);
+    }
+
+    return ESP_OK;
 }
 
 esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,

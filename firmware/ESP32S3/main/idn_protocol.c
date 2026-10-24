@@ -244,7 +244,8 @@ typedef struct {
 static rp_sample_t       *s_ring      = NULL;
 static volatile uint32_t  s_ring_head = 0;
 static volatile uint32_t  s_ring_tail = 0;
-static uint32_t           s_applied_rate = 0;
+static uint32_t           s_applied_rate = 0;     /* rate the RP runs */
+static uint32_t           s_requested_rate = 0;   /* rate the sender's chunks imply */
 
 static inline uint32_t ring_size(void)
 {
@@ -286,24 +287,36 @@ static uint32_t ring_read(rp_sample_t *out, uint32_t n)
 
 static void ring_clear(void) { s_ring_head = 0; s_ring_tail = 0; }
 
+static const char *TAG = "idn";
+
 static void apply_sample_rate(uint32_t rate)
 {
     if (rate < 1000 || rate > 100000) {
         return;
     }
 
-    uint32_t diff = s_applied_rate > rate ? s_applied_rate - rate : rate - s_applied_rate;
-    if (s_applied_rate != 0 && diff < IDN_RATE_HYSTERESIS) {
+    /*
+       Compare with what was asked, not what the RP applied: a sender above
+       the scanner limit asks for the same rate in every chunk, and must not
+       cost a UART command per chunk.
+    */
+    uint32_t diff = s_requested_rate > rate ? s_requested_rate - rate : rate - s_requested_rate;
+    if (s_requested_rate != 0 && diff < IDN_RATE_HYSTERESIS) {
         return;
     }
 
-    if (rp_manager_set_rate(rate) == ESP_OK) {
-        s_applied_rate = rate;
+    uint32_t applied = rate;
+    if (rp_manager_set_rate_applied(rate, &applied) == ESP_OK) {
+        s_requested_rate = rate;
+        s_applied_rate = applied;
+        if (applied != rate) {
+            ESP_LOGW(TAG, "Sender rate %lu pps above scanner limit; running %lu, excess will be dropped",
+                     (unsigned long)rate, (unsigned long)applied);
+        }
     }
 }
 
 /* -- Module globals --------------------------------------------------------- */
-static const char *TAG = "idn";
 
 static uint8_t s_mac[6];
 static int     s_sock = -1;
@@ -665,6 +678,7 @@ static void session_close(void)
     memset(s_channels, 0, sizeof(s_channels));
     s_client_active = false;
     s_applied_rate = 0;
+    s_requested_rate = 0;
 }
 
 static void session_check_timeout(void)

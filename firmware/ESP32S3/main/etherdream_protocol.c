@@ -702,11 +702,12 @@ static void handle_client(int sock)
                 uint32_t rate = begin.point_rate;
                 if (rate == 0) rate = ED_DEFAULT_POINT_RATE;
                 if (rate > ED_MAX_POINT_RATE) rate = ED_MAX_POINT_RATE;
-                s_point_rate   = rate;
+                uint32_t applied = rate;
+                rp_manager_set_rate_applied(rate, &applied);
+                s_point_rate   = applied;   /* status reports the rate really running */
                 s_pb_state     = PB_PLAYING;
                 s_output_armed = true;
-                rp_manager_set_rate(rate);
-                ESP_LOGI(TAG, "Begin @ %lu pps", (unsigned long)rate);
+                ESP_LOGI(TAG, "Begin @ %lu pps (running %lu)", (unsigned long)rate, (unsigned long)applied);
                 if (!send_response(sock, RESP_ACK, cmd)) break;
                 continue;
             }
@@ -725,9 +726,10 @@ static void handle_client(int sock)
                 uint32_t rate = update.point_rate;
                 if (rate == 0) rate = ED_DEFAULT_POINT_RATE;
                 if (rate > ED_MAX_POINT_RATE) rate = ED_MAX_POINT_RATE;
-                s_point_rate = rate;
-                rp_manager_set_rate(rate);
-                ESP_LOGI(TAG, "Update @ %lu pps", (unsigned long)rate);
+                uint32_t applied = rate;
+                rp_manager_set_rate_applied(rate, &applied);
+                s_point_rate = applied;
+                ESP_LOGI(TAG, "Update @ %lu pps (running %lu)", (unsigned long)rate, (unsigned long)applied);
                 if (!send_response(sock, RESP_ACK, cmd)) break;
                 continue;
             }
@@ -802,9 +804,10 @@ static void handle_client(int sock)
                             rq_head  = (rq_head + 1) % RATE_QUEUE_CAP;
                             rq_count--;
                             if (new_rate > 0 && new_rate <= ED_MAX_POINT_RATE) {
-                                s_point_rate = new_rate;
-                                rp_manager_set_rate(new_rate);
-                                ESP_LOGI(TAG, "Rate -> %lu pps", (unsigned long)new_rate);
+                                uint32_t applied = new_rate;
+                                rp_manager_set_rate_applied(new_rate, &applied);
+                                s_point_rate = applied;
+                                ESP_LOGI(TAG, "Rate -> %lu pps (running %lu)", (unsigned long)new_rate, (unsigned long)applied);
                             }
                         }
                     }
@@ -1005,6 +1008,14 @@ static void listener_task(void *arg)
 }
 
 /* -- UDP broadcast task ----------------------------------------------------- */
+
+/* Tell clients the scanner limit, so a well-behaved one never asks for more. */
+static uint32_t advertised_max_rate(void)
+{
+    uint32_t limit = rp_manager_get_rate_limit();
+    return limit < ED_MAX_POINT_RATE ? limit : ED_MAX_POINT_RATE;
+}
+
 static void broadcast_task(void *arg)
 {
     (void)arg;
@@ -1050,7 +1061,7 @@ static void broadcast_task(void *arg)
         pkt.hw_revision    = 0x0002;
         pkt.sw_revision    = 0x0002;
         pkt.buffer_capacity = (uint16_t)ED_BUFFER_CAPACITY;
-        pkt.max_point_rate  = ED_MAX_POINT_RATE;
+        pkt.max_point_rate  = advertised_max_rate();
         pkt.status          = make_status();
 
         int64_t now = esp_timer_get_time();
@@ -1070,7 +1081,7 @@ static void broadcast_task(void *arg)
             reply.hw_revision    = 0x0002;
             reply.sw_revision    = 0x0002;
             reply.buffer_capacity = (uint16_t)ED_BUFFER_CAPACITY;
-            reply.max_point_rate  = ED_MAX_POINT_RATE;
+            reply.max_point_rate  = advertised_max_rate();
             reply.status          = make_status();
             sendto(sock, &reply, sizeof(reply), 0,
                    (struct sockaddr *)&from, sizeof(from));

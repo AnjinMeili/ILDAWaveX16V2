@@ -6,6 +6,16 @@
 
 #define RP_SAMPLE_CHANNELS 8
 
+/*
+   Scanner rate limit. Every RATE sent to the RP is clamped to this, whatever
+   protocol or page asked for it; the RP firmware (0.2.0+) keeps its own copy
+   in flash and clamps as well. 30 kpps is what any ILDA-rated scanner can do
+   at the test-pattern angle; raise it for faster scanners.
+*/
+#define RP_DEFAULT_RATE_LIMIT_HZ 30000u
+#define RP_MIN_RATE_LIMIT_HZ 1000u
+#define RP_MAX_RATE_LIMIT_HZ 200000u
+
 #define RP_STREAM_SAMPLES_PER_PACKET 256
 #define RP_STREAM_HEADER_BYTES 12
 #define RP_STREAM_PAYLOAD_BYTES (RP_STREAM_SAMPLES_PER_PACKET * RP_SAMPLE_CHANNELS * 2)
@@ -39,6 +49,10 @@ typedef struct {
     bool remote_mirror_y;
     uint32_t remote_underruns;
 
+    uint32_t rate_limit;              /* ESP32-side limit, saved in NVS */
+    uint32_t remote_max_rate;         /* RP's own limit; 0 = RP firmware without one */
+    uint32_t remote_requested_rate;   /* last rate asked of the RP before clamping */
+
     uint32_t remote_stream_packets;
     uint32_t remote_stream_bad_packets;
     uint32_t remote_stream_dropped_packets;
@@ -58,6 +72,10 @@ esp_err_t rp_manager_output_force_stop(void);
 esp_err_t rp_manager_output_discard_unstarted(void);
 esp_err_t rp_manager_clear_buffer(void);
 esp_err_t rp_manager_set_rate(uint32_t rate_hz);
+/* As rp_manager_set_rate; *applied receives the rate the RP now runs. */
+esp_err_t rp_manager_set_rate_applied(uint32_t rate_hz, uint32_t *applied);
+esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz);
+uint32_t rp_manager_get_rate_limit(void);
 esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,
                                        uint32_t high_water_samples,
                                        uint32_t low_water_samples);
