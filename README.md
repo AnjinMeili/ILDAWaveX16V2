@@ -36,6 +36,8 @@ ILDAWaveX16/
 > [!NOTE]
 > The ESP32-S3 firmware is also compatible with the original **ILDAWaveX16 V1** board. To build for V1, use `./tools/build-firmware.sh esp32 --board-version 1` or set `BOARD_VERSION` to `1` in `firmware/ESP32S3/main/CMakeLists.txt` for an IDE build.
 > Performance on V1 is currently more limited than on V2, so please treat V1 support as experimental.
+> V1 has the scanner rate limit but no colour shift, and its test patterns do not include Colour Shift.
+> `python3 tools/build_all.py` builds the ESP32-S3 firmware for V1 and V2 and the RP2354 firmware from a scratch copy of the tree, so a change that breaks the V1 build shows up without a V1 board.
 
 ---
 
