@@ -62,15 +62,15 @@ static bool parse_u32_arg(const char *line, const char *key, uint32_t *out)
 
 static void save_current_settings(void)
 {
-    bool mx, my;
+    rp_settings_t settings;
 
-    output_engine_get_mirror(&mx, &my);
+    settings.buffer_size_samples       = ring_get_capacity();
+    settings.buffer_high_water_samples = ring_get_high_water();
+    settings.buffer_low_water_samples  = ring_get_low_water();
+    output_engine_get_mirror(&settings.mirror_x, &settings.mirror_y);
+    settings.max_rate_hz = output_engine_get_max_rate();
 
-    rp_settings_save(ring_get_capacity(),
-                     ring_get_high_water(),
-                     ring_get_low_water(),
-                     mx,
-                     my);
+    rp_settings_save(&settings);
 }
 
 void rp_uart_init(void)
@@ -117,7 +117,9 @@ static void send_status(void)
         "dropped_packets=%lu "
         "rx_timeouts=%lu "
         "mirror_x=%lu "
-        "mirror_y=%lu",
+        "mirror_y=%lu "
+        "max_rate=%lu "
+        "requested_rate=%lu",
         out.running ? 1ul : 0ul,
         (unsigned long)out.sample_rate_hz,
         (unsigned long)ring_get_fill(),
@@ -132,7 +134,9 @@ static void send_status(void)
         (unsigned long)rx.stream_dropped_packets,
         (unsigned long)rx.stream_rx_timeouts,
         out.mirror_x ? 1ul : 0ul,
-        out.mirror_y ? 1ul : 0ul
+        out.mirror_y ? 1ul : 0ul,
+        (unsigned long)out.max_rate_hz,
+        (unsigned long)out.requested_rate_hz
     );
 
     uart_send_line(line);
@@ -182,11 +186,35 @@ static void handle_line(char *line)
 
         output_engine_status_t out;
         output_engine_get_status(&out);
-        rp_log("command=RATE requested=%lu applied=%lu",
+        rp_log("command=RATE requested=%lu applied=%lu max=%lu",
                (unsigned long)rate,
+               (unsigned long)out.sample_rate_hz,
+               (unsigned long)out.max_rate_hz);
+
+        /* The applied rate follows, so the ESP32 can show the real one. */
+        char reply[48];
+        snprintf(reply, sizeof(reply), "OK RATE %lu", (unsigned long)out.sample_rate_hz);
+        uart_send_line(reply);
+        return;
+    }
+
+    if (strncmp(line, "LIMIT ", 6) == 0) {
+        uint32_t max_rate = output_engine_get_max_rate();
+
+        parse_u32_arg(line, "max_rate=", &max_rate);
+
+        output_engine_set_max_rate(max_rate);
+        save_current_settings();
+
+        output_engine_status_t out;
+        output_engine_get_status(&out);
+        rp_log("command=LIMIT max_rate=%lu applied_rate=%lu",
+               (unsigned long)out.max_rate_hz,
                (unsigned long)out.sample_rate_hz);
 
-        uart_send_line("OK RATE");
+        char reply[48];
+        snprintf(reply, sizeof(reply), "OK LIMIT %lu", (unsigned long)out.max_rate_hz);
+        uart_send_line(reply);
         return;
     }
 

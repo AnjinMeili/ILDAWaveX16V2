@@ -12,6 +12,9 @@
 #include "project_config.h"
 
 #define OUTPUT_DEFAULT_SAMPLE_RATE_HZ 30000
+#define OUTPUT_DEFAULT_MAX_RATE_HZ    30000
+#define OUTPUT_ABSOLUTE_MAX_RATE_HZ   200000
+#define OUTPUT_MIN_MAX_RATE_HZ        1000
 
 #define OUTPUT_BATCH_SAMPLES DAC_BATCH_MAX_SAMPLES
 #define BATCH_MODE_MIN_RATE_HZ 5000
@@ -34,6 +37,8 @@
 static volatile bool s_running = false;
 static volatile bool s_core1_idle = true;
 static volatile uint32_t s_sample_rate_hz = OUTPUT_DEFAULT_SAMPLE_RATE_HZ;
+static volatile uint32_t s_requested_rate_hz = OUTPUT_DEFAULT_SAMPLE_RATE_HZ;
+static volatile uint32_t s_max_rate_hz = OUTPUT_DEFAULT_MAX_RATE_HZ;
 static volatile bool s_mirror_x = false;
 static volatile bool s_mirror_y = true;
 
@@ -351,8 +356,8 @@ static void output_one_sample_timed(absolute_time_t *next_time)
         rate = 1;
     }
 
-    if (rate > 200000) {
-        rate = 200000;
+    if (rate > OUTPUT_ABSOLUTE_MAX_RATE_HZ) {
+        rate = OUTPUT_ABSOLUTE_MAX_RATE_HZ;
     }
 
     int64_t period_us = 1000000LL / rate;
@@ -690,18 +695,49 @@ void output_engine_resume_after_flash(void)
     launch_output_core();
 }
 
-void output_engine_set_rate(uint32_t rate_hz)
+static void apply_rate_locked_by_limit(void)
 {
+    uint32_t rate_hz = s_requested_rate_hz;
+
     if (rate_hz < 1) {
         rate_hz = 1;
     }
 
-    if (rate_hz > 200000) {
-        rate_hz = 200000;
+    if (rate_hz > s_max_rate_hz) {
+        rate_hz = s_max_rate_hz;
+    }
+
+    if (rate_hz > OUTPUT_ABSOLUTE_MAX_RATE_HZ) {
+        rate_hz = OUTPUT_ABSOLUTE_MAX_RATE_HZ;
     }
 
     s_sample_rate_hz = rate_hz;
     dac_set_sample_rate(rate_hz);
+}
+
+void output_engine_set_rate(uint32_t rate_hz)
+{
+    s_requested_rate_hz = rate_hz;
+    apply_rate_locked_by_limit();
+}
+
+void output_engine_set_max_rate(uint32_t max_rate_hz)
+{
+    if (max_rate_hz < OUTPUT_MIN_MAX_RATE_HZ) {
+        max_rate_hz = OUTPUT_MIN_MAX_RATE_HZ;
+    }
+
+    if (max_rate_hz > OUTPUT_ABSOLUTE_MAX_RATE_HZ) {
+        max_rate_hz = OUTPUT_ABSOLUTE_MAX_RATE_HZ;
+    }
+
+    s_max_rate_hz = max_rate_hz;
+    apply_rate_locked_by_limit();
+}
+
+uint32_t output_engine_get_max_rate(void)
+{
+    return s_max_rate_hz;
 }
 
 void output_engine_set_mirror(bool mirror_x, bool mirror_y)
@@ -731,6 +767,8 @@ void output_engine_get_status(output_engine_status_t *status)
 
     status->running = s_running;
     status->sample_rate_hz = s_sample_rate_hz;
+    status->requested_rate_hz = s_requested_rate_hz;
+    status->max_rate_hz = s_max_rate_hz;
     status->consumed_samples = s_consumed_samples;
     status->underruns = s_underruns;
     status->failsafe_blank_events = s_failsafe_blank_events;
