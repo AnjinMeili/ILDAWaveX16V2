@@ -6,10 +6,10 @@
 #include "ring_buffer.h"
 
 typedef enum {
-    OUTPUT_MODE_HARD_ZERO,
-    OUTPUT_MODE_START_BLANK,
+    OUTPUT_MODE_PARKED,          /* stopped: X/Y at centre, laser channels at 0 V */
+    OUTPUT_MODE_START_BLANK,     /* STARTed, waiting for the first sample */
     OUTPUT_MODE_STREAMING,
-    OUTPUT_MODE_UNDERRUN_BLANK,
+    OUTPUT_MODE_UNDERRUN_BLANK,  /* ring empty: holding X/Y, laser channels at 0 V */
     OUTPUT_MODE_FAILSAFE_BLANK,
 } output_engine_mode_t;
 

@@ -157,21 +157,21 @@ static void handle_line(char *line)
 
     if (strcmp(line, "START") == 0) {
         output_engine_start();
-        rp_log("command=START output=START_BLANK xy=center channels=blank");
+        rp_log("command=START output=START_BLANK xy=center channels=blank soft_start=10ms");
         uart_send_line("OK START");
         return;
     }
 
     if (strcmp(line, "STOP") == 0) {
         output_engine_stop_safe();
-        rp_log("command=STOP output=HARD_ZERO all_channels=1");
+        rp_log("command=STOP output=PARKED xy=center channels=0V");
         uart_send_line("OK STOP");
         return;
     }
 
     if (strcmp(line, "CLEAR") == 0) {
         output_engine_stop_safe();
-        rp_log("command=CLEAR output=HARD_ZERO ring=cleared");
+        rp_log("command=CLEAR output=PARKED ring=cleared");
         uart_send_line("OK CLEAR");
         return;
     }
@@ -202,7 +202,7 @@ static void handle_line(char *line)
         output_engine_stop_safe();
         ring_configure(size, high_water, low_water);
         save_current_settings();
-        rp_log("command=BUFFER size=%lu high_water=%lu low_water=%lu output=HARD_ZERO",
+        rp_log("command=BUFFER size=%lu high_water=%lu low_water=%lu output=PARKED",
                (unsigned long)ring_get_capacity(),
                (unsigned long)ring_get_high_water(),
                (unsigned long)ring_get_low_water());

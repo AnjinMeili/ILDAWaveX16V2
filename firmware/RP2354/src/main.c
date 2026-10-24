@@ -12,8 +12,8 @@
 static const char *output_mode_name(output_engine_mode_t mode)
 {
     switch (mode) {
-    case OUTPUT_MODE_HARD_ZERO:
-        return "HARD_ZERO";
+    case OUTPUT_MODE_PARKED:
+        return "PARKED";
     case OUTPUT_MODE_START_BLANK:
         return "START_BLANK";
     case OUTPUT_MODE_STREAMING:
@@ -148,7 +148,7 @@ int main(void)
     while (true) {
         if (!startup_logged && rp_log_console_connected()) {
             rp_log("boot version=%s watchdog_reset=%u", RP_FW_VERSION, watchdog_reset ? 1u : 0u);
-            rp_log("ready buffer=%lu high_water=%lu low_water=%lu mirror_x=%u mirror_y=%u output=HARD_ZERO",
+            rp_log("ready buffer=%lu high_water=%lu low_water=%lu mirror_x=%u mirror_y=%u output=PARKED",
                    (unsigned long)ring_get_capacity(),
                    (unsigned long)ring_get_high_water(),
                    (unsigned long)ring_get_low_water(),

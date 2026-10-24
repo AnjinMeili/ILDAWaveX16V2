@@ -183,6 +183,22 @@ bool ring_pop(int16_t *sample)
     return ok;
 }
 
+bool ring_peek(int16_t *sample)
+{
+    bool ok = false;
+
+    critical_section_enter_blocking(&s_ring_cs);
+
+    if (s_fill > 0) {
+        memcpy(sample, s_ring[s_tail], RP_SAMPLE_CHANNELS * sizeof(int16_t));
+        ok = true;
+    }
+
+    critical_section_exit(&s_ring_cs);
+
+    return ok;
+}
+
 uint32_t ring_pop_block(int16_t samples[][RP_SAMPLE_CHANNELS], uint32_t count)
 {
     if (!samples || count == 0) {

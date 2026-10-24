@@ -19,7 +19,20 @@
 #define FAILSAFE_TIMEOUT_US 20000
 #define FAILSAFE_REPEAT_US 5000
 
+/*
+   Blanked X/Y moves between the parked centre and the stream take this long
+   at the current rate. A one-sample step to a far point is a square-wave
+   input to the scanner amplifiers; a 10 ms ramp is an ordinary blanked move.
+*/
+#define SOFT_MOVE_US 10000
+#define SOFT_MOVE_MIN_SAMPLES 16
+#define SOFT_MOVE_MAX_SAMPLES 1024
+
+/* How long STOP waits for the output core to finish its current batch. */
+#define CORE1_IDLE_WAIT_US 50000
+
 static volatile bool s_running = false;
+static volatile bool s_core1_idle = true;
 static volatile uint32_t s_sample_rate_hz = OUTPUT_DEFAULT_SAMPLE_RATE_HZ;
 static volatile bool s_mirror_x = false;
 static volatile bool s_mirror_y = true;
@@ -28,7 +41,7 @@ static volatile uint32_t s_consumed_samples = 0;
 static volatile uint32_t s_underruns = 0;
 static volatile uint32_t s_failsafe_blank_events = 0;
 static volatile uint32_t s_mode_transitions = 0;
-static volatile output_engine_mode_t s_output_mode = OUTPUT_MODE_HARD_ZERO;
+static volatile output_engine_mode_t s_output_mode = OUTPUT_MODE_PARKED;
 
 static int16_t s_last_output[RP_SAMPLE_CHANNELS];
 
@@ -44,6 +57,13 @@ static volatile bool s_core1_launched = false;
 static bool s_have_valid_xy = false;
 static int16_t s_last_valid_x = 0;
 static int16_t s_last_valid_y = 0;
+
+/* Soft start: blanked move from centre to the first point of a stream. */
+static uint32_t s_preroll_total = 0;
+static uint32_t s_preroll_done = 0;
+static int16_t s_preroll_to_x = 0;
+static int16_t s_preroll_to_y = 0;
+static bool s_preroll_armed = false;   /* one ramp per START, then the stream plays */
 
 static void trace_pins_init(void)
 {
@@ -96,15 +116,49 @@ static void note_output_starved(void)
     }
 }
 
-static void sample_hard_zero(int16_t sample[RP_SAMPLE_CHANNELS])
+static int16_t lerp_i16(int16_t from, int16_t to, uint32_t step, uint32_t steps)
+{
+    if (steps == 0 || step >= steps) {
+        return to;
+    }
+
+    int32_t delta = (int32_t)to - (int32_t)from;
+    return (int16_t)((int32_t)from + (int32_t)(((int64_t)delta * (int64_t)step) / (int64_t)steps));
+}
+
+static uint32_t soft_move_samples(void)
+{
+    uint32_t n = (uint32_t)(((uint64_t)s_sample_rate_hz * SOFT_MOVE_US) / 1000000ULL);
+
+    if (n < SOFT_MOVE_MIN_SAMPLES) {
+        n = SOFT_MOVE_MIN_SAMPLES;
+    }
+
+    if (n > SOFT_MOVE_MAX_SAMPLES) {
+        n = SOFT_MOVE_MAX_SAMPLES;
+    }
+
+    return n;
+}
+
+static void sample_blanked_at(int16_t sample[RP_SAMPLE_CHANNELS], int16_t x, int16_t y)
+{
+    sample[0] = x;
+    sample[1] = y;
+
+    /* Laser/colour/intensity and aux channels raw 0x0000. */
+    for (int i = 2; i < RP_SAMPLE_CHANNELS; i++) {
+        sample[i] = INT16_MIN;
+    }
+}
+
+static void sample_parked(int16_t sample[RP_SAMPLE_CHANNELS])
 {
     /*
-       signed -32768 maps to raw DAC code 0x0000.
-       Used only for stopped/boot/status hard-zero state.
+       Parked: scanners at centre (signed 0 = raw 0x8000 = 0 V on the ILDA
+       X/Y pairs), every laser channel at raw 0x0000 = 0 V.
     */
-    for (int i = 0; i < RP_SAMPLE_CHANNELS; i++) {
-        sample[i] = (int16_t)-32768;
-    }
+    sample_blanked_at(sample, 0, 0);
 }
 
 static int16_t mirror_i16(int16_t v)
@@ -140,11 +194,7 @@ static void get_hold_xy(int16_t *x, int16_t *y)
         *x = s_last_valid_x;
         *y = s_last_valid_y;
     } else {
-        /*
-           No real point has arrived yet after START.
-           Use scanner center while laser is blanked.
-           signed 0 maps to raw DAC 0x8000.
-        */
+        /* No real point since START: hold the centre, where STOP parked. */
         *x = 0;
         *y = 0;
     }
@@ -156,19 +206,7 @@ static void sample_blanked_hold_xy(int16_t sample[RP_SAMPLE_CHANNELS])
     int16_t y;
 
     get_hold_xy(&x, &y);
-
-    sample[0] = x;
-    sample[1] = y;
-
-    /*
-       Laser/color/intensity and aux channels raw 0x0000.
-    */
-    sample[2] = (int16_t)-32768;
-    sample[3] = (int16_t)-32768;
-    sample[4] = (int16_t)-32768;
-    sample[5] = (int16_t)-32768;
-    sample[6] = (int16_t)-32768;
-    sample[7] = (int16_t)-32768;
+    sample_blanked_at(sample, x, y);
 }
 
 static void dac_write_blanked_xy_mirrored(int16_t x, int16_t y)
@@ -177,10 +215,10 @@ static void dac_write_blanked_xy_mirrored(int16_t x, int16_t y)
     dac_write_blanked_xy(x, y);
 }
 
-static void set_last_output_hard_zero(void)
+static void set_last_output_parked(void)
 {
     critical_section_enter_blocking(&s_output_cs);
-    sample_hard_zero(s_last_output);
+    sample_parked(s_last_output);
     critical_section_exit(&s_output_cs);
 }
 
@@ -240,6 +278,69 @@ static void failsafe_check_no_samples(void)
     }
 }
 
+/* -- Soft start ------------------------------------------------------------- */
+
+static void preroll_reset(void)
+{
+    s_preroll_total = 0;
+    s_preroll_done = 0;
+    s_preroll_to_x = 0;
+    s_preroll_to_y = 0;
+    s_preroll_armed = false;
+}
+
+static bool preroll_active(void)
+{
+    return s_preroll_done < s_preroll_total;
+}
+
+/*
+   Before the first sample of a stream plays, look at it and queue a blanked
+   ramp from the parked centre to its position. The stream itself starts
+   SOFT_MOVE_US later and continues from that point without a step.
+*/
+static void preroll_arm_if_needed(void)
+{
+    int16_t first[RP_SAMPLE_CHANNELS];
+
+    if (s_have_valid_xy || s_preroll_armed) {
+        return;
+    }
+
+    if (!ring_peek(first)) {
+        return;
+    }
+
+    /* Arm once per START: when the ramp ends the first sample is popped
+       for real, which sets s_have_valid_xy. Without this latch the ramp
+       would re-arm forever and the stream would never play. */
+    s_preroll_armed = true;
+
+    if (first[0] == 0 && first[1] == 0) {
+        return;
+    }
+
+    s_preroll_to_x = first[0];
+    s_preroll_to_y = first[1];
+    s_preroll_total = soft_move_samples();
+    s_preroll_done = 0;
+}
+
+static bool preroll_next(int16_t sample[RP_SAMPLE_CHANNELS])
+{
+    if (!preroll_active()) {
+        return false;
+    }
+
+    s_preroll_done++;
+    sample_blanked_at(sample,
+                      lerp_i16(0, s_preroll_to_x, s_preroll_done, s_preroll_total),
+                      lerp_i16(0, s_preroll_to_y, s_preroll_done, s_preroll_total));
+    return true;
+}
+
+/* -- Output paths ----------------------------------------------------------- */
+
 static void output_one_sample_timed(absolute_time_t *next_time)
 {
     int16_t sample[RP_SAMPLE_CHANNELS];
@@ -267,6 +368,19 @@ static void output_one_sample_timed(absolute_time_t *next_time)
         return;
     }
 
+    preroll_arm_if_needed();
+
+    if (preroll_next(sample)) {
+        apply_output_mirror(sample);
+
+        critical_section_enter_blocking(&s_output_cs);
+        memcpy(s_last_output, sample, sizeof(sample));
+        critical_section_exit(&s_output_cs);
+
+        dac_write_sample(sample);
+        return;
+    }
+
     if (ring_pop(sample)) {
         set_output_mode(OUTPUT_MODE_STREAMING);
         note_valid_sample(sample);
@@ -279,8 +393,6 @@ static void output_one_sample_timed(absolute_time_t *next_time)
 
         if (s_running) {
             dac_write_sample(sample);
-        } else {
-            dac_write_all_zero();
         }
     } else {
         int16_t blanked[RP_SAMPLE_CHANNELS];
@@ -296,11 +408,38 @@ static void output_one_sample_timed(absolute_time_t *next_time)
 
         failsafe_check_no_samples();
 
-        /*
-           Active underrun:
-           blank laser channels, but do not slam X/Y to raw 0x0000.
-        */
-        dac_write_sample(blanked);
+        /* Underrun: blank the laser channels, hold X/Y where they are. */
+        if (s_running) {
+            dac_write_sample(blanked);
+        }
+    }
+}
+
+static void output_preroll_batch(void)
+{
+    uint32_t i = 0;
+
+    while (i < OUTPUT_BATCH_SAMPLES && preroll_next(s_batch[i])) {
+        i++;
+    }
+
+    /* The ramp ended inside this batch: wait at its end, blanked. */
+    for (; i < OUTPUT_BATCH_SAMPLES; i++) {
+        sample_blanked_at(s_batch[i], s_preroll_to_x, s_preroll_to_y);
+    }
+
+    for (i = 0; i < OUTPUT_BATCH_SAMPLES; i++) {
+        apply_output_mirror(s_batch[i]);
+    }
+
+    critical_section_enter_blocking(&s_output_cs);
+    memcpy(s_last_output,
+           s_batch[OUTPUT_BATCH_SAMPLES - 1],
+           RP_SAMPLE_CHANNELS * sizeof(int16_t));
+    critical_section_exit(&s_output_cs);
+
+    if (s_running) {
+        dac_write_sample_batch((const int16_t (*)[RP_SAMPLE_CHANNELS])s_batch, OUTPUT_BATCH_SAMPLES);
     }
 }
 
@@ -308,9 +447,18 @@ static void output_batch(void)
 {
     uint32_t got = 0;
 
-    if (s_running) {
-        got = ring_pop_block(s_batch, OUTPUT_BATCH_SAMPLES);
+    if (!s_running) {
+        return;
     }
+
+    preroll_arm_if_needed();
+
+    if (preroll_active()) {
+        output_preroll_batch();
+        return;
+    }
+
+    got = ring_pop_block(s_batch, OUTPUT_BATCH_SAMPLES);
 
     for (uint32_t i = 0; i < got; i++) {
         note_valid_sample(s_batch[i]);
@@ -328,54 +476,84 @@ static void output_batch(void)
 
     uint32_t missing = OUTPUT_BATCH_SAMPLES - got;
 
-    if (s_running) {
-        if (got == 0) {
-            note_output_starved();
-        } else {
-            set_output_mode(missing > 0 ? OUTPUT_MODE_UNDERRUN_BLANK : OUTPUT_MODE_STREAMING);
-        }
+    if (got == 0) {
+        note_output_starved();
+    } else {
+        set_output_mode(missing > 0 ? OUTPUT_MODE_UNDERRUN_BLANK : OUTPUT_MODE_STREAMING);
     }
 
-    if (s_running) {
-        critical_section_enter_blocking(&s_output_cs);
-        s_consumed_samples += got;
-        s_underruns += missing;
-        memcpy(s_last_output,
-               s_batch[OUTPUT_BATCH_SAMPLES - 1],
-               RP_SAMPLE_CHANNELS * sizeof(int16_t));
-        critical_section_exit(&s_output_cs);
-    }
+    critical_section_enter_blocking(&s_output_cs);
+    s_consumed_samples += got;
+    s_underruns += missing;
+    memcpy(s_last_output,
+           s_batch[OUTPUT_BATCH_SAMPLES - 1],
+           RP_SAMPLE_CHANNELS * sizeof(int16_t));
+    critical_section_exit(&s_output_cs);
 
     if (missing > 0) {
         failsafe_check_no_samples();
     }
 
+    /*
+       Missing samples inside the batch are blanked-hold-XY samples. If STOP
+       arrived meanwhile, write nothing: STOP moves the scanners itself.
+    */
     if (s_running) {
-        /*
-           Missing samples inside the batch are now blanked-hold-XY samples.
-           No all-zero scanner jumps are injected during active streaming.
-        */
         dac_write_sample_batch((const int16_t (*)[RP_SAMPLE_CHANNELS])s_batch, OUTPUT_BATCH_SAMPLES);
-    } else {
-        dac_write_all_zero();
     }
 }
 
-static void stop_stream_state(void)
+/* -- Start / stop ----------------------------------------------------------- */
+
+static void wait_core1_idle(void)
+{
+    if (!s_core1_launched) {
+        return;
+    }
+
+    absolute_time_t deadline = make_timeout_time_us(CORE1_IDLE_WAIT_US);
+
+    while (!s_core1_idle && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+        tight_loop_contents();
+    }
+}
+
+static void halt_output_core(void)
 {
     s_running = false;
     set_trace_running(false);
-    set_output_mode(OUTPUT_MODE_HARD_ZERO);
+    wait_core1_idle();
+}
 
+static void reset_stream_state(void)
+{
     ring_clear();
-    set_last_output_hard_zero();
 
     s_have_valid_xy = false;
     s_last_valid_x = 0;
     s_last_valid_y = 0;
+    preroll_reset();
 
     s_last_valid_sample_time = get_absolute_time();
     s_last_forced_blank_time = s_last_valid_sample_time;
+}
+
+/*
+   Blanked move from the last commanded X/Y (already mirrored) to the centre,
+   one DAC write per sample period. Each dac_write_blanked_xy() blocks for
+   exactly one sample at the current rate, so the loop paces itself.
+*/
+static void park_ramp(int16_t from_x, int16_t from_y)
+{
+    if (from_x == 0 && from_y == 0) {
+        return;
+    }
+
+    uint32_t n = soft_move_samples();
+
+    for (uint32_t i = 1; i <= n; i++) {
+        dac_write_blanked_xy(lerp_i16(from_x, 0, i, n), lerp_i16(from_y, 0, i, n));
+    }
 }
 
 static void output_core_main(void)
@@ -388,8 +566,17 @@ static void output_core_main(void)
         uint32_t rate = s_sample_rate_hz;
 
         if (!s_running) {
+            s_core1_idle = true;
             sleep_ms(1);
             next_time = get_absolute_time();
+            continue;
+        }
+
+        s_core1_idle = false;
+
+        /* STOP may have landed between the check above and the flag. */
+        if (!s_running) {
+            s_core1_idle = true;
             continue;
         }
 
@@ -414,11 +601,12 @@ void output_engine_init(void)
     critical_section_init(&s_output_cs);
     trace_pins_init();
 
-    set_last_output_hard_zero();
+    set_last_output_parked();
 
     s_have_valid_xy = false;
     s_last_valid_x = 0;
     s_last_valid_y = 0;
+    preroll_reset();
 
     s_last_valid_sample_time = get_absolute_time();
     s_last_forced_blank_time = s_last_valid_sample_time;
@@ -432,23 +620,29 @@ void output_engine_init(void)
     */
     dac_set_sample_rate(s_sample_rate_hz);
 
-    dac_write_all_zero();
+    dac_write_park();
 
     launch_output_core();
 }
 
 void output_engine_start(void)
 {
+    if (s_running) {
+        return;
+    }
+
     s_last_valid_sample_time = get_absolute_time();
     s_last_forced_blank_time = s_last_valid_sample_time;
 
     /*
-       Until the first real point arrives, keep scanner centered
-       and laser/color/intensity blanked.
+       Until the first real point arrives, keep the scanners at the centre,
+       where STOP parked them, with the laser blanked. The first point is
+       then reached by a blanked ramp (see preroll_arm_if_needed).
     */
     s_have_valid_xy = false;
     s_last_valid_x = 0;
     s_last_valid_y = 0;
+    preroll_reset();
 
     dac_write_blanked_xy(0, 0);
 
@@ -461,20 +655,31 @@ void output_engine_start(void)
 
 void output_engine_stop_safe(void)
 {
-    stop_stream_state();
+    int16_t from_x;
+    int16_t from_y;
 
-    /*
-       Fully stopped state:
-       hard raw-zero on every physical DAC channel.
-    */
-    dac_write_all_zero();
-    dac_write_all_zero();
-    dac_write_all_zero();
+    halt_output_core();
+
+    critical_section_enter_blocking(&s_output_cs);
+    from_x = s_last_output[0];
+    from_y = s_last_output[1];
+    critical_section_exit(&s_output_cs);
+
+    reset_stream_state();
+
+    /* Laser channels go to 0 V on the first ramp sample; X/Y walk to centre. */
+    park_ramp(from_x, from_y);
+
+    set_output_mode(OUTPUT_MODE_PARKED);
+    set_last_output_parked();
+    dac_write_park();
 }
 
 void output_engine_pause_for_flash(void)
 {
-    stop_stream_state();
+    halt_output_core();
+    reset_stream_state();
+    set_output_mode(OUTPUT_MODE_PARKED);
     sleep_ms(5);
 }
 
