@@ -11,6 +11,7 @@ typedef struct {
     uint32_t stream_bad_packets;
     uint32_t stream_dropped_packets;
     uint32_t stream_rx_timeouts;
+    uint32_t stream_stale_packets;   /* received across a STOP/CLEAR and discarded */
 } stream_rx_status_t;
 
 void stream_rx_init(void);

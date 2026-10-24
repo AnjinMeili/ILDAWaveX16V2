@@ -26,3 +26,5 @@ uint32_t ring_get_fill(void);
 uint32_t ring_get_capacity(void);
 uint32_t ring_get_high_water(void);
 uint32_t ring_get_low_water(void);
+/* Incremented by every ring_clear() and ring_configure(). */
+uint32_t ring_get_epoch(void);

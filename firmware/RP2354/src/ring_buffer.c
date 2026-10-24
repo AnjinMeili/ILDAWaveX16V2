@@ -12,6 +12,7 @@ static volatile uint32_t s_fill = 0;
 static volatile uint32_t s_capacity = RP_RING_SAMPLES;
 static volatile uint32_t s_high_water = RP_RING_HIGH_WATER;
 static volatile uint32_t s_low_water = RP_RING_LOW_WATER;
+static volatile uint32_t s_epoch = 0;
 
 static critical_section_t s_ring_cs;
 
@@ -75,7 +76,13 @@ void ring_clear(void)
     s_head = 0;
     s_tail = 0;
     s_fill = 0;
+    s_epoch++;
     critical_section_exit(&s_ring_cs);
+}
+
+uint32_t ring_get_epoch(void)
+{
+    return s_epoch;
 }
 
 void ring_configure(uint32_t capacity_samples,
@@ -93,6 +100,7 @@ void ring_configure(uint32_t capacity_samples,
     s_capacity = capacity;
     s_high_water = high_water;
     s_low_water = low_water;
+    s_epoch++;
     critical_section_exit(&s_ring_cs);
 }
 

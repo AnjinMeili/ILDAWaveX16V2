@@ -38,6 +38,8 @@ static volatile uint32_t s_stream_bad_packets = 0;
 static volatile uint32_t s_stream_dropped_packets = 0;
 static volatile uint32_t s_stream_rx_timeouts = 0;
 static volatile bool s_flow_paused = false;
+static volatile uint32_t s_stale_packets = 0;
+static uint32_t s_packet_epoch = 0;
 
 static uint32_t s_packet_words[STREAM_PACKET_BYTES];
 static uint8_t s_packet_bytes[STREAM_PACKET_BYTES];
@@ -155,6 +157,9 @@ bool stream_rx_receive_packet(uint32_t timeout_ms)
     dma_channel_start(s_payload_dma_chan);
     pio_sm_set_enabled(s_payload_pio, s_payload_sm, true);
 
+    /* Remember which stream this packet belongs to (see stream_rx_process_packet). */
+    s_packet_epoch = ring_get_epoch();
+
     sleep_us(5);
     gpio_put(RP_READY_GPIO, 1);
 
@@ -207,6 +212,18 @@ void stream_rx_process_packet(void)
         return;
     }
 
+    /*
+       UART commands are handled while a packet is still arriving. A STOP or
+       CLEAR that landed mid-transfer already emptied the ring for the
+       stream this packet belongs to; queuing it now would make the next
+       START play a stale packet, and jump to it from the parked centre.
+    */
+    if (ring_get_epoch() != s_packet_epoch) {
+        s_stale_packets++;
+        s_stream_packets++;
+        return;
+    }
+
     const int16_t *samples = (const int16_t *)payload;
 
     uint32_t pushed = ring_push_block(samples, STREAM_SAMPLES_PER_PACKET);
@@ -233,4 +250,5 @@ void stream_rx_get_status(stream_rx_status_t *status)
     status->stream_bad_packets = s_stream_bad_packets;
     status->stream_dropped_packets = s_stream_dropped_packets;
     status->stream_rx_timeouts = s_stream_rx_timeouts;
+    status->stream_stale_packets = s_stale_packets;
 }
