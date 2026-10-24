@@ -99,6 +99,7 @@ static rp_status_t s_status = {
     .remote_buffer_size_samples = V1_RING_SIZE,
     .rate_limit             = RP_DEFAULT_RATE_LIMIT_HZ,
     .remote_max_rate        = RP_DEFAULT_RATE_LIMIT_HZ,
+    .remote_color_shift_saved = true,
     .last_error             = ESP_OK,
     .remote_fw_version      = "V1-ESP32S3",
 };
@@ -832,6 +833,18 @@ esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz)
     }
 
     return ESP_OK;
+}
+
+/* V1 has no colour delay line; the web page shows the error. */
+esp_err_t rp_manager_set_color_shift(int32_t shift_us)
+{
+    (void)shift_us;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t rp_manager_save_color_shift(void)
+{
+    return ESP_ERR_NOT_SUPPORTED;
 }
 
 esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,

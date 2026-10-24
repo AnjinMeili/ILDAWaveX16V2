@@ -782,6 +782,9 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
             "\"remote_max_lit_step\":%lu,"
             "\"remote_lit_big_steps\":%lu,"
             "\"remote_blank_big_steps\":%lu,"
+            "\"remote_color_shift_us\":%ld,"
+            "\"remote_color_shift_samples\":%lu,"
+            "\"remote_color_shift_saved\":%s,"
             "\"remote_stale_packets\":%lu,"
             "\"remote_underruns\":%lu,"
             "\"remote_stream_packets\":%lu,"
@@ -824,6 +827,9 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
         (unsigned long)rp.remote_max_lit_step,
         (unsigned long)rp.remote_lit_big_steps,
         (unsigned long)rp.remote_blank_big_steps,
+        (long)rp.remote_color_shift_us,
+        (unsigned long)rp.remote_color_shift_samples,
+        rp.remote_color_shift_saved ? "true" : "false",
         (unsigned long)rp.remote_stale_packets,
         (unsigned long)rp.remote_underruns,
         (unsigned long)rp.remote_stream_packets,
@@ -1255,6 +1261,8 @@ static esp_err_t rp_start_stream_post_handler(httpd_req_t *req)
             test_shape = RP_TEST_SHAPE_CROSS;
         } else if (strcasecmp(shape, "heart") == 0) {
             test_shape = RP_TEST_SHAPE_HEART;
+        } else if (strcasecmp(shape, "colorshift") == 0) {
+            test_shape = RP_TEST_SHAPE_COLOR_SHIFT;
         } else {
             test_shape = RP_TEST_SHAPE_SQUARE;
         }
@@ -1335,6 +1343,37 @@ static esp_err_t rp_rate_limit_post_handler(httpd_req_t *req)
     }
 
     return send_plain_result(req, rp_manager_set_rate_limit(limit));
+}
+
+static esp_err_t rp_color_shift_post_handler(httpd_req_t *req)
+{
+    char query[64];
+    char param[32];
+
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) {
+        return send_bad_request(req, "Colour shift value is required");
+    }
+
+    /* ?save=1 writes the applied shift to RP flash; refused while running. */
+    if (httpd_query_key_value(query, "save", param, sizeof(param)) == ESP_OK) {
+        esp_err_t ret = rp_manager_save_color_shift();
+        if (ret == ESP_ERR_INVALID_STATE) {
+            return send_bad_request(req, "Stop output to save the colour shift");
+        }
+        return send_plain_result(req, ret);
+    }
+
+    if (httpd_query_key_value(query, "value", param, sizeof(param)) != ESP_OK) {
+        return send_bad_request(req, "Colour shift value is required");
+    }
+
+    long shift_us = strtol(param, NULL, 10);
+
+    if (shift_us < -2000 || shift_us > 2000) {
+        return send_bad_request(req, "Colour shift must be between -2000 and 2000 microseconds");
+    }
+
+    return send_plain_result(req, rp_manager_set_color_shift((int32_t)shift_us));
 }
 
 static esp_err_t rp_buffer_config_post_handler(httpd_req_t *req)
@@ -1678,7 +1717,12 @@ static const char *html_page =
 "<div class='fieldrow'><div class='k'>Mirror X</div><div class='v'><label class='checkrow'><input id='mirrorX' type='checkbox' onchange='onMirrorInput()'>Enabled</label></div></div>"
 "<div class='fieldrow'><div class='k'>Mirror Y</div><div class='v'><label class='checkrow'><input id='mirrorY' type='checkbox' onchange='onMirrorInput()'>Enabled</label></div></div>"
 "</div>"
-"<div class='actions bufActions'><button class='green' onclick='saveMirrorSettings()'>Save</button><span id='mirrorSaveMsg' class='saveMsg'>Applies immediately and saves to DAC Engine flash.</span></div></div>"
+"<div class='actions bufActions'><button class='green' onclick='saveMirrorSettings()'>Save</button><span id='mirrorSaveMsg' class='saveMsg'>Applies immediately and saves to DAC Engine flash.</span></div>"
+"<div class='rows' style='margin-top:10px'><div class='fieldrow'><div class='k'>Colour shift</div><div class='v'><div class='inlineForm'><input id='colorShiftInput' type='number' min='-2000' max='2000' step='5' oninput='colorShiftDirty=true'><span class='muted'>&micro;s</span><button onclick='applyColorShift()'>Apply</button><button class='green' onclick='saveColorShift()'>Save</button></div>"
+"<div class='actions' style='padding:8px 0 0'><button onclick='stepColorShift(-10)'>&minus;10</button><button onclick='stepColorShift(-1)'>&minus;1</button><button onclick='stepColorShift(1)'>+1</button><button onclick='stepColorShift(10)'>+10</button></div>"
+"<div><span id='colorShiftMsg' class='saveMsg'></span></div>"
+"<div class='note' style='padding:8px 0 0'>Run the Colour Shift test pattern, step the shift until every row's gaps sit on the red, green and blue columns, then stop output and press Save. While output runs, changes apply at once but are not kept after a restart until saved.</div></div></div></div>"
+"<div class='note' style='padding:8px 0 0'>Delays the colour channels behind the scanner position (positive) so lit segments start and end where the beam really is. Applies to every source, including SD playback.</div></div>"
 
 "<div class='card'><h3>DAC Buffer</h3>"
 "<table><thead><tr><th>Setting</th><th class='bufInputCol'>Value</th><th class='bufInfoCol'>Active / Limit</th><th>Description</th></tr></thead>"
@@ -1775,6 +1819,7 @@ static const char *html_page =
 "<button onclick='post(\"/api/rp/start_test_stream?shape=circle\")'>Circle</button>"
 "<button onclick='post(\"/api/rp/start_test_stream?shape=cross\")'>Cross</button>"
 "<button onclick='post(\"/api/rp/start_test_stream?shape=heart\")'>Heart</button>"
+"<button onclick='post(\"/api/rp/start_test_stream?shape=colorshift\")'>Colour Shift</button>"
 "</div>"
 "<div class='actions' style='padding-top:0'>"
 "<button id='testRedBtn' class='toggle red' onclick='toggleTestColor(1)'>Red</button>"
@@ -1803,12 +1848,18 @@ static const char *html_page =
 "</main></div>"
 
 "<script>"
-"let rateLimitDirty=false;let prev=null;let rates={underruns:0,payload:0,packets:0,bad:0,dropped:0,rxTimeouts:0,sd:0,idn:0,ether:0,ilw:0};let bufDirty=false;let mirrorDirty=false;let lastRpStatus=null;let lastSdSig=null;let currentSdPath='';let diagBase=null;let testColorMask=7;"
+"let rateLimitDirty=false;let colorShiftDirty=false;let prev=null;let rates={underruns:0,payload:0,packets:0,bad:0,dropped:0,rxTimeouts:0,sd:0,idn:0,ether:0,ilw:0};let bufDirty=false;let mirrorDirty=false;let lastRpStatus=null;let lastSdSig=null;let currentSdPath='';let diagBase=null;let testColorMask=7;"
 "function showTab(id,btn){btn=btn||document.querySelector('.nav button[data-tab='+id+']');document.querySelectorAll('.section').forEach(s=>s.classList.remove('active'));document.getElementById(id).classList.add('active');document.querySelectorAll('.nav button').forEach(b=>b.classList.remove('active'));if(btn)btn.classList.add('active');document.getElementById('crumb').innerText=btn?btn.innerText:id;if(id==='playback')loadSdFiles();if(id==='protocols')loadProtocolSettings();if(id==='network')loadNetworkSettings();}"
 "function post(url){return fetch(url,{method:'POST'}).then(r=>r.text()).then(t=>{console.log(url,t);setTimeout(update,120);return t;});}"
 "function refreshEngine(){return post('/api/scan/refresh');}"
 "function stopAll(){return post('/api/rp/stop');}"
 "function setRate(r){return post('/api/rp/set_rate?value='+encodeURIComponent(r));}"
+"function setColorShiftMsg(t,kind){let e=document.getElementById('colorShiftMsg');if(e){e.innerText=t;e.className='saveMsg '+(kind||'');}}"
+"function shiftReq(q,busy,done){setColorShiftMsg(busy,'ok');return fetch('/api/rp/color_shift?'+q,{method:'POST'}).then(r=>r.text().then(t=>{if(!r.ok||!t.startsWith('OK')){throw new Error(t.startsWith('ERR ')?t.substring(4):t);}colorShiftDirty=false;setColorShiftMsg(done,'ok');setTimeout(update,120);return t;})).catch(e=>setColorShiftMsg(e.message||'Failed','err'));}"
+"function applyColorShift(){let v=Number(val('colorShiftInput'));if(!Number.isInteger(v)||v<-2000||v>2000){setColorShiftMsg('Enter -2000 to 2000','err');return;}return shiftReq('value='+v,'Applying...','Applied.');}"
+"function stepColorShift(d){let e=document.getElementById('colorShiftInput');let v=Math.max(-2000,Math.min(2000,(Number(e&&e.value)||0)+d));if(e)e.value=v;return shiftReq('value='+v,'Applying...','Applied.');}"
+"function saveColorShift(){let v=Number(val('colorShiftInput'));if(!Number.isInteger(v)||v<-2000||v>2000){setColorShiftMsg('Enter -2000 to 2000','err');return;}if(lastRpStatus&&lastRpStatus.remote_running){setColorShiftMsg('Stop output to save','err');return;}return shiftReq('value='+v,'Saving...','Saved.').then(()=>shiftReq('save=1','Saving...','Saved.'));}"
+"function syncColorShift(j){if(!colorShiftDirty)setValIfIdle('colorShiftInput',j.remote_color_shift_us||0);let m=document.getElementById('colorShiftMsg');if(m&&!colorShiftDirty&&m.className.indexOf('err')<0)m.innerText=(j.remote_color_shift_us||0)+' \u00b5s = '+(j.remote_color_shift_samples||0)+' samples at '+fmtKpps(j.remote_sample_rate)+(j.remote_color_shift_saved===false?' (applied, not saved)':' (saved)');}"
 "function setRateLimitMsg(t,kind){let e=document.getElementById('rateLimitMsg');if(e){e.innerText=t;e.className='saveMsg '+(kind||'');}}"
 "function saveRateLimit(){let lim=Number(val('rateLimitInput'));if(!Number.isInteger(lim)||lim<1000||lim>200000){setRateLimitMsg('Enter a limit between 1000 and 200000 pps','err');return;}setRateLimitMsg('Saving...','ok');return fetch('/api/rp/rate_limit?value='+lim,{method:'POST'}).then(r=>r.text().then(t=>{if(!r.ok||!t.startsWith('OK')){throw new Error(t.startsWith('ERR ')?t.substring(4):t);}rateLimitDirty=false;setRateLimitMsg('Saved and applied.','ok');setTimeout(update,120);return t;})).catch(e=>setRateLimitMsg(e.message||'Save failed','err'));}"
 "function matchRateLimitPreset(v){let s=document.getElementById('rateLimitPreset');if(!s||document.activeElement===s)return;let n=Number(v);s.value=Array.from(s.options).some(o=>o.value&&Number(o.value)===n)?String(n):'';}"
@@ -1877,7 +1928,7 @@ static const char *html_page =
 "function syncMirrorFields(j){if(!mirrorDirty){setChecked('mirrorX',!!j.remote_mirror_x);setChecked('mirrorY',!!j.remote_mirror_y);}}"
 "function syncBufferFields(j){let rpMax=Number(j.remote_buffer_max_samples||0);let rpSize=Number(j.remote_buffer_size_samples||0);let rpHigh=Number(j.remote_buffer_high_water_samples||0);let rpLow=Number(j.remote_buffer_low_water_samples||0);let sizeLimit=rpMax||rpSize;let highLimit=rpSize>256?rpSize-256:0;if(rpSize&&!rpHigh)rpHigh=defaultHigh(rpSize);let lowLimit=rpHigh>256?rpHigh-256:0;setText('bufSizeInfo',rpSize?(rpSize+' / '+sizeLimit):'--');setText('bufHighInfo',rpHigh?(rpHigh+' / '+highLimit):'--');setText('bufLowInfo',rpHigh?(rpLow+' / '+lowLimit):'--');if(!bufDirty){setValIfIdle('bufSizeInput',rpSize||'');setValIfIdle('bufHighInput',rpHigh||'');setValIfIdle('bufLowInput',rpLow);}}"
 "function updateBufferMeter(j){let size=Number(j.remote_buffer_size_samples||0);let fill=Number(j.remote_buffer_fill_samples||0);let low=Number(j.remote_buffer_low_water_samples||0);let high=Number(j.remote_buffer_high_water_samples||0);let lf=size?Math.max(0,Math.min(100,low*100/size)):0;let hf=size?Math.max(lf,Math.min(100,high*100/size)):0;let ff=size?Math.max(0,Math.min(100,fill*100/size)):0;let f=document.getElementById('topBufferFill');let lm=document.getElementById('topBufLowMark');let hm=document.getElementById('topBufHighMark');if(f){f.style.width=ff+'%';f.style.background=!size?'rgba(74,163,255,.35)':fill>=high?'rgba(217,155,40,.55)':fill<low?'rgba(29,191,115,.5)':'rgba(74,163,255,.45)';}if(lm)lm.style.left=lf+'%';if(hm)hm.style.left=hf+'%';}"
-"function render(j){lastRpStatus=j;calcRates(j);setButtonState(j.remote_running);syncBufferFields(j);syncMirrorFields(j);syncRateLimit(j);syncSdFiles(j);syncProtocolRates();syncDiagnosticTotals(j);updateBufferMeter(j);let dacEngineOk=!!j.initialized;let dacRun=!!j.remote_running;let bufferText=fmtBuffer(j);if(j.product)document.title=j.product;setText('brandName',j.product);setText('aboutEspFw',j.esp_fw);setText('aboutRpFw',j.rp_fw);setText('topRate',fmtKpps(j.remote_sample_rate));setText('topFill',bufferText);setClass('topConn',dacEngineOk?'topItem ok':'topItem bad');setClass('topState',dacRun?'topItem ok':'topItem bad');setText('dashUnderrunRate',rates.underruns.toFixed(1));setText('dashPayloadRate',rates.payload.toFixed(1));setClass('dashUnderrunRate',rates.underruns>0?'v status-warn':'v status-ok');setClass('dashPayloadRate',rates.payload>0?'v status-bad':'v status-ok');document.getElementById('status').innerText=JSON.stringify(diagnosticStatus(j),null,2);}"
+"function render(j){lastRpStatus=j;calcRates(j);setButtonState(j.remote_running);syncBufferFields(j);syncMirrorFields(j);syncRateLimit(j);syncColorShift(j);syncSdFiles(j);syncProtocolRates();syncDiagnosticTotals(j);updateBufferMeter(j);let dacEngineOk=!!j.initialized;let dacRun=!!j.remote_running;let bufferText=fmtBuffer(j);if(j.product)document.title=j.product;setText('brandName',j.product);setText('aboutEspFw',j.esp_fw);setText('aboutRpFw',j.rp_fw);setText('topRate',fmtKpps(j.remote_sample_rate));setText('topFill',bufferText);setClass('topConn',dacEngineOk?'topItem ok':'topItem bad');setClass('topState',dacRun?'topItem ok':'topItem bad');setText('dashUnderrunRate',rates.underruns.toFixed(1));setText('dashPayloadRate',rates.payload.toFixed(1));setClass('dashUnderrunRate',rates.underruns>0?'v status-warn':'v status-ok');setClass('dashPayloadRate',rates.payload>0?'v status-bad':'v status-ok');document.getElementById('status').innerText=JSON.stringify(diagnosticStatus(j),null,2);}"
 "function update(){fetch('/api/rp/status',{cache:'no-store'}).then(r=>r.json()).then(j=>{render(j);followPlayer(j);syncPreviewProjectControls(j);}).catch(e=>{setClass('topConn','topItem bad');});}"
 "let previewFrames=[];"
 "function showPreviewFrame(frame){if(frame<0||frame>=previewFrameCount)return;previewFrame=frame;let current=previewFrames[frame];previewFramePoints=Number(current.point_count)||0;setText('previewFrameLabel','Frame '+(frame+1)+' / '+previewFrameCount);setText('previewSelectedPoints',previewFramePoints.toLocaleString());document.getElementById('previewPrevBtn').disabled=frame===0;document.getElementById('previewNextBtn').disabled=frame+1>=previewFrameCount;document.getElementById('previewPlayBtn').disabled=previewFrameCount<2;drawIldaPreview(current.points||[]);}"
@@ -1991,6 +2042,7 @@ esp_err_t web_server_start(void)
     ESP_ERROR_CHECK(register_handler("/api/rp/stop_test_stream", HTTP_POST, rp_stop_stream_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/set_rate", HTTP_POST, rp_set_rate_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/rate_limit", HTTP_POST, rp_rate_limit_post_handler));
+    ESP_ERROR_CHECK(register_handler("/api/rp/color_shift", HTTP_POST, rp_color_shift_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/buffer_config", HTTP_POST, rp_buffer_config_post_handler));
     ESP_ERROR_CHECK(register_handler("/api/rp/mirror_config", HTTP_POST, rp_mirror_config_post_handler));
 

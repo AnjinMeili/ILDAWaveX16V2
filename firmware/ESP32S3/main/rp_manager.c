@@ -145,6 +145,25 @@ static void put_u32_le(uint8_t *p, uint32_t v)
     p[3] = (uint8_t)(v >> 24);
 }
 
+static int parse_i32_key(const char *s, const char *key, int32_t *out)
+{
+    const char *p = strstr(s, key);
+
+    if (!p) {
+        return 0;
+    }
+
+    p += strlen(key);
+
+    long v = 0;
+    if (sscanf(p, "%ld", &v) == 1) {
+        *out = (int32_t)v;
+        return 1;
+    }
+
+    return 0;
+}
+
 static int parse_u32_key(const char *s, const char *key, uint32_t *out)
 {
     const char *p = strstr(s, key);
@@ -218,7 +237,7 @@ static esp_err_t push_rate_limit_locked(uint32_t limit_hz);
 
 static esp_err_t refresh_status_locked(void)
 {
-    char resp[512];
+    static char resp[640];   /* under s_rp_mutex; STATUS is long */
 
     esp_err_t ret = uart_cmd_locked("STATUS", resp, sizeof(resp));
     if (ret != ESP_OK) {
@@ -325,6 +344,19 @@ parse_status:
         s_status.remote_stale_packets = v;
     }
 
+    int32_t sv = 0;
+    if (parse_i32_key(resp, "color_shift_us=", &sv)) {
+        s_status.remote_color_shift_us = sv;
+    }
+
+    if (parse_u32_key(resp, "color_shift_samples=", &v)) {
+        s_status.remote_color_shift_samples = v;
+    }
+
+    /* RP firmware without the key always saved on SHIFT. */
+    s_status.remote_color_shift_saved =
+        !parse_u32_key(resp, "color_shift_saved=", &v) || v != 0;
+
     s_status.last_error = ESP_OK;
 
     /*
@@ -426,6 +458,84 @@ static void line_point(int32_t ax, int32_t ay,
     *y = lerp_i32(ay, by, pos, span);
 }
 
+/*
+   Colour shift test frame, half scale. White rows, alternately drawn left
+   to right and right to left, cross three fixed columns (red, green, blue).
+   Each row is blanked for a short index gap centred on each column. A
+   column does not move sideways with the colour shift; a row's gaps slide
+   along its direction of travel. With the shift right, every row's gaps sit
+   on the columns; wrong, the gaps of neighbouring rows stagger opposite ways.
+*/
+#define CS_ROW_X    16000
+#define CS_COL_X    10000
+#define CS_COL_Y    14000
+#define CS_GAP_HALF 800
+
+typedef struct {
+    int16_t ax, ay, bx, by;
+    uint16_t samples;
+    uint8_t color;      /* colour bits; 0 = blanked move */
+    bool index_gaps;
+} test_segment_t;
+
+static const test_segment_t s_color_shift_frame[] = {
+    { -CS_ROW_X,  -9000,  CS_ROW_X,  -9000, 192, 7, true },
+    {  CS_ROW_X,  -9000,  CS_ROW_X,  -3000,  32, 0, false },
+    {  CS_ROW_X,  -3000, -CS_ROW_X,  -3000, 192, 7, true },
+    { -CS_ROW_X,  -3000, -CS_ROW_X,   3000,  32, 0, false },
+    { -CS_ROW_X,   3000,  CS_ROW_X,   3000, 192, 7, true },
+    {  CS_ROW_X,   3000,  CS_ROW_X,   9000,  32, 0, false },
+    {  CS_ROW_X,   9000, -CS_ROW_X,   9000, 192, 7, true },
+    { -CS_ROW_X,   9000, -CS_COL_X, -CS_COL_Y, 64, 0, false },
+    { -CS_COL_X, -CS_COL_Y, -CS_COL_X, CS_COL_Y, 160, 1, false },
+    { -CS_COL_X,  CS_COL_Y,  0,  CS_COL_Y,   32, 0, false },
+    {  0,  CS_COL_Y,  0, -CS_COL_Y,         160, 2, false },
+    {  0, -CS_COL_Y,  CS_COL_X, -CS_COL_Y,   32, 0, false },
+    {  CS_COL_X, -CS_COL_Y,  CS_COL_X, CS_COL_Y, 160, 4, false },
+    {  CS_COL_X,  CS_COL_Y, -CS_ROW_X, -9000, 96, 0, false },
+};
+
+#define CS_SEGMENTS (sizeof(s_color_shift_frame) / sizeof(s_color_shift_frame[0]))
+
+/* Position and colour bits of sample p of the colour shift frame. */
+static uint8_t color_shift_point(uint32_t p, uint8_t color_mask, int32_t *x, int32_t *y)
+{
+    uint32_t total = 0;
+
+    for (size_t i = 0; i < CS_SEGMENTS; i++) {
+        total += s_color_shift_frame[i].samples;
+    }
+
+    uint32_t t = p % total;
+    size_t i = 0;
+
+    while (t >= s_color_shift_frame[i].samples) {
+        t -= s_color_shift_frame[i].samples;
+        i++;
+    }
+
+    const test_segment_t *seg = &s_color_shift_frame[i];
+
+    line_point(seg->ax, seg->ay, seg->bx, seg->by, t, seg->samples - 1u, x, y);
+
+    if (seg->color == 0) {
+        return 0;
+    }
+
+    if (seg->index_gaps) {
+        for (int32_t cx = -CS_COL_X; cx <= CS_COL_X; cx += CS_COL_X) {
+            int32_t dx = *x - cx;
+            if (dx > -CS_GAP_HALF && dx < CS_GAP_HALF) {
+                return 0;
+            }
+        }
+    }
+
+    /* A single-colour laser still sees every column in its own colour. */
+    uint8_t bits = seg->color & color_mask;
+    return bits ? bits : color_mask;
+}
+
 static void build_test_samples(int16_t samples[RP_STREAM_SAMPLES_PER_PACKET][RP_SAMPLE_CHANNELS])
 {
     const rp_test_shape_t shape = s_test_shape;
@@ -436,10 +546,14 @@ static void build_test_samples(int16_t samples[RP_STREAM_SAMPLES_PER_PACKET][RP_
         int32_t x = 0;
         int32_t y = 0;
         bool blanked = false;
+        uint8_t bits = color_mask;
 
         if (shape == RP_TEST_SHAPE_BEAM) {
             x = 0;
             y = 0;
+        } else if (shape == RP_TEST_SHAPE_COLOR_SHIFT) {
+            bits = color_shift_point(p, color_mask, &x, &y);
+            blanked = bits == 0;
         } else if (shape == RP_TEST_SHAPE_CIRCLE) {
             const int32_t r = 32767;
             const uint32_t rr = (uint32_t)(r * r);
@@ -519,10 +633,10 @@ static void build_test_samples(int16_t samples[RP_STREAM_SAMPLES_PER_PACKET][RP_
 
         samples[s][0] = clamp_i16(x);
         samples[s][1] = clamp_i16(y);
-        samples[s][2] = (!blanked && (color_mask & 0x01)) ? 32767 : -32768;
-        samples[s][3] = (!blanked && (color_mask & 0x02)) ? 32767 : -32768;
-        samples[s][4] = (!blanked && (color_mask & 0x04)) ? 32767 : -32768;
-        samples[s][5] = (!blanked && color_mask) ? 32767 : -32768;
+        samples[s][2] = (!blanked && (bits & 0x01)) ? 32767 : -32768;
+        samples[s][3] = (!blanked && (bits & 0x02)) ? 32767 : -32768;
+        samples[s][4] = (!blanked && (bits & 0x04)) ? 32767 : -32768;
+        samples[s][5] = (!blanked && bits) ? 32767 : -32768;
         for (int ch = 6; ch < RP_SAMPLE_CHANNELS; ch++) {
             samples[s][ch] = 0;
         }
@@ -1170,6 +1284,48 @@ esp_err_t rp_manager_set_rate(uint32_t rate_hz)
 uint32_t rp_manager_get_rate_limit(void)
 {
     return s_status.rate_limit;
+}
+
+/* Send one SHIFT command and record the RP's "OK SHIFT <us> saved=<0|1>". */
+static esp_err_t shift_cmd(const char *cmd)
+{
+    char resp[128];
+
+    xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
+
+    esp_err_t ret = uart_cmd_locked_timeout(cmd, resp, sizeof(resp), RP_CONFIG_CMD_TIMEOUT_MS);
+    if (ret == ESP_OK && strncmp(resp, "OK SHIFT", 8) == 0) {
+        long v = 0;
+        uint32_t saved = 1;
+        if (sscanf(resp + 8, "%ld", &v) == 1) {
+            s_status.remote_color_shift_us = (int32_t)v;
+        }
+        parse_u32_key(resp, "saved=", &saved);
+        s_status.remote_color_shift_saved = saved != 0;
+    } else if (ret == ESP_OK && strncmp(resp, "ERR SHIFT", 9) == 0) {
+        ret = ESP_ERR_INVALID_STATE;   /* save refused while output runs */
+        ESP_LOGW(TAG, "%s: '%s'", cmd, resp);
+    } else if (ret == ESP_OK) {
+        ret = ESP_ERR_NOT_SUPPORTED;   /* RP firmware without SHIFT */
+        ESP_LOGW(TAG, "SHIFT not supported by RP: '%s'", resp);
+    }
+
+    xSemaphoreGive(s_rp_mutex);
+
+    return ret;
+}
+
+esp_err_t rp_manager_set_color_shift(int32_t shift_us)
+{
+    char cmd[64];
+
+    snprintf(cmd, sizeof(cmd), "SHIFT color_us=%ld", (long)shift_us);
+    return shift_cmd(cmd);
+}
+
+esp_err_t rp_manager_save_color_shift(void)
+{
+    return shift_cmd("SHIFT save");
 }
 
 esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz)

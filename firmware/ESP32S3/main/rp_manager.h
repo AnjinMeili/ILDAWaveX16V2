@@ -27,6 +27,7 @@ typedef enum {
     RP_TEST_SHAPE_CIRCLE,
     RP_TEST_SHAPE_CROSS,
     RP_TEST_SHAPE_HEART,
+    RP_TEST_SHAPE_COLOR_SHIFT,   /* white rows with index gaps across R/G/B columns */
 } rp_test_shape_t;
 
 typedef struct {
@@ -55,6 +56,9 @@ typedef struct {
     uint32_t remote_max_lit_step;     /* largest lit X/Y step since START, 0..65535 */
     uint32_t remote_lit_big_steps;    /* lit steps >= 1/8 full scale since START */
     uint32_t remote_blank_big_steps;
+    int32_t  remote_color_shift_us;      /* RP 0.2.0+: colour delay against X/Y */
+    uint32_t remote_color_shift_samples;
+    bool     remote_color_shift_saved;   /* false: applied while running, not in RP flash */
     uint32_t remote_stale_packets;
 
     uint32_t remote_stream_packets;
@@ -79,6 +83,10 @@ esp_err_t rp_manager_set_rate(uint32_t rate_hz);
 /* As rp_manager_set_rate; *applied receives the rate the RP now runs. */
 esp_err_t rp_manager_set_rate_applied(uint32_t rate_hz, uint32_t *applied);
 esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz);
+/* Applies at once; the RP saves it only while output is stopped. */
+esp_err_t rp_manager_set_color_shift(int32_t shift_us);
+/* Saves the applied colour shift to RP flash; fails while output runs. */
+esp_err_t rp_manager_save_color_shift(void);
 uint32_t rp_manager_get_rate_limit(void);
 esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,
                                        uint32_t high_water_samples,
