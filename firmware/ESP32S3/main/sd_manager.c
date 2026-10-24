@@ -267,7 +267,7 @@ void sd_manager_get_status(sd_status_t *status)
 #if BOARD_VERSION != 1
 static void sd_hotplug_task(void *arg)
 {
-    bool last_inserted = false;
+    bool last_inserted = s_status.inserted;
 
     while (1) {
         bool now_inserted = sd_card_inserted_debounced();

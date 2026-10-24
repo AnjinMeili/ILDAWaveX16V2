@@ -12,6 +12,7 @@ void dac_init(void);
 void dac_set_sample_rate(uint32_t sample_rate_hz);
 void dac_set_active_mask(uint8_t mask);
 uint8_t dac_get_active_mask(void);
+uint32_t dac_get_dma_words_submitted(void);
 
 void dac_write_sample(const int16_t sample[RP_SAMPLE_CHANNELS]);
 void dac_write_sample_batch(const int16_t samples[][RP_SAMPLE_CHANNELS], uint32_t count);

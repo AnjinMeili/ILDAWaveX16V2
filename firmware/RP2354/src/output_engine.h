@@ -5,11 +5,22 @@
 
 #include "ring_buffer.h"
 
+typedef enum {
+    OUTPUT_MODE_HARD_ZERO,
+    OUTPUT_MODE_START_BLANK,
+    OUTPUT_MODE_STREAMING,
+    OUTPUT_MODE_UNDERRUN_BLANK,
+    OUTPUT_MODE_FAILSAFE_BLANK,
+} output_engine_mode_t;
+
 typedef struct {
     bool running;
     uint32_t sample_rate_hz;
     uint32_t consumed_samples;
     uint32_t underruns;
+    uint32_t failsafe_blank_events;
+    uint32_t mode_transitions;
+    output_engine_mode_t mode;
     bool mirror_x;
     bool mirror_y;
     int16_t last_output[RP_SAMPLE_CHANNELS];

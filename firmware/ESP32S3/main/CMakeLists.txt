@@ -13,6 +13,7 @@ set(COMMON_SRCS
     "web_server.c"
     "sd_manager.c"
     "ilda_player.c"
+    "ilda_preview.c"
     "protocol_stream_stats.c"
     "protocol_settings.c"
     "etherdream_protocol.c"
