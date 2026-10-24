@@ -1297,7 +1297,8 @@ static esp_err_t rp_test_color_post_handler(httpd_req_t *req)
 
 static esp_err_t rp_stop_stream_post_handler(httpd_req_t *req)
 {
-    return send_plain_result(req, rp_manager_stop_test_stream());
+    /* A Stop button leaves the scanners parked and the laser off, whatever started output. */
+    return send_plain_result(req, stop_everything_safe());
 }
 
 static esp_err_t rp_set_rate_post_handler(httpd_req_t *req)

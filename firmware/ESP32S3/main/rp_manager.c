@@ -50,6 +50,25 @@ static uint16_t s_stream_seq = 0;
 static volatile uint32_t s_stream_generation = 0;
 static uint32_t s_test_phase = 0;
 static int      s_output_ref = 0;   /* ref-count: START sent at 0->1, STOP at 1->0 */
+static bool     s_test_holds_output = false;   /* the test stream owns one s_output_ref */
+
+/*
+   A pattern picked while one runs is switched by the generator, with a
+   blanked move from its last point to the new pattern's first point.
+*/
+static volatile bool s_test_switch_pending = false;
+static volatile rp_test_shape_t s_test_next_shape = RP_TEST_SHAPE_BEAM;
+static int32_t  s_test_last_x = 0;
+static int32_t  s_test_last_y = 0;
+static int32_t  s_test_from_x = 0;
+static int32_t  s_test_from_y = 0;
+static int32_t  s_test_to_x = 0;
+static int32_t  s_test_to_y = 0;
+static uint32_t s_test_move_pos = 0;
+static uint32_t s_test_move_len = 0;
+
+#define TEST_SWITCH_STEP  512   /* blanked move, units per sample */
+#define TEST_SWITCH_DWELL 8     /* blanked samples held at the new first point */
 
 static rp_status_t s_status = {
     .initialized = false,
@@ -536,113 +555,161 @@ static uint8_t color_shift_point(uint32_t p, uint8_t color_mask, int32_t *x, int
     return bits ? bits : color_mask;
 }
 
+/* Position and colour bits (0 = blanked) of sample p of a test shape. */
+static uint8_t test_shape_point(rp_test_shape_t shape, uint32_t p, uint8_t color_mask,
+                                int32_t *out_x, int32_t *out_y)
+{
+    int32_t x = 0;
+    int32_t y = 0;
+    bool blanked = false;
+    uint8_t bits = color_mask;
+
+    if (shape == RP_TEST_SHAPE_BEAM) {
+        x = 0;
+        y = 0;
+    } else if (shape == RP_TEST_SHAPE_COLOR_SHIFT) {
+        bits = color_shift_point(p, color_mask, &x, &y);
+        blanked = bits == 0;
+    } else if (shape == RP_TEST_SHAPE_CIRCLE) {
+        const int32_t r = 32767;
+        const uint32_t rr = (uint32_t)(r * r);
+        uint32_t t = p % 1024;
+        uint32_t q = t & 255u;
+        int32_t v = r - (int32_t)((q * (uint32_t)r) / 255u);
+        int32_t h = (int32_t)isqrt_u32(rr - (uint32_t)(v * v));
+
+        if (t < 256u) {
+            x = v;
+            y = h;
+        } else if (t < 512u) {
+            x = -h;
+            y = v;
+        } else if (t < 768u) {
+            x = -v;
+            y = -h;
+        } else {
+            x = h;
+            y = -v;
+        }
+    } else if (shape == RP_TEST_SHAPE_CROSS) {
+        uint32_t t = p % 1024;
+
+        if (t < 448u) {
+            line_point(-32768, 0, 32767, 0, t, 447u, &x, &y);
+        } else if (t < 512u) {
+            blanked = true;
+            line_point(32767, 0, 0, -32768, t - 448u, 63u, &x, &y);
+        } else if (t < 960u) {
+            line_point(0, -32768, 0, 32767, t - 512u, 447u, &x, &y);
+        } else {
+            blanked = true;
+            line_point(0, 32767, -32768, 0, t - 960u, 63u, &x, &y);
+        }
+    } else if (shape == RP_TEST_SHAPE_HEART) {
+        uint32_t t = p % 1536;
+        uint32_t seg = t / 256u;
+        uint32_t q = t & 255u;
+
+        switch (seg) {
+        case 0:
+            line_point(0, 12000, -21000, 30000, q, 255u, &x, &y);
+            break;
+        case 1:
+            line_point(-21000, 30000, -32768, 5000, q, 255u, &x, &y);
+            break;
+        case 2:
+            line_point(-32768, 5000, 0, -32768, q, 255u, &x, &y);
+            break;
+        case 3:
+            line_point(0, -32768, 32767, 5000, q, 255u, &x, &y);
+            break;
+        case 4:
+            line_point(32767, 5000, 21000, 30000, q, 255u, &x, &y);
+            break;
+        default:
+            line_point(21000, 30000, 0, 12000, q, 255u, &x, &y);
+            break;
+        }
+    } else {
+        uint32_t t = p % 1280;
+
+        if (t < 256u) {
+            line_point(-32768, -32768, 32767, -32768, t, 255u, &x, &y);
+        } else if (t < 512u) {
+            line_point(32767, -32768, 32767, 32767, t - 256u, 255u, &x, &y);
+        } else if (t < 768u) {
+            line_point(32767, 32767, -32768, 32767, t - 512u, 255u, &x, &y);
+        } else if (t < 1024u) {
+            line_point(-32768, 32767, -32768, -32768, t - 768u, 255u, &x, &y);
+        } else {
+            blanked = true;
+            line_point(-32768, -32768, -32768, -32768, t - 1024u, 255u, &x, &y);
+        }
+    }
+
+    *out_x = x;
+    *out_y = y;
+    return blanked ? 0 : bits;
+}
+
+/* Start the blanked move to `shape`, from the last point sent. */
+static void test_switch_begin(rp_test_shape_t shape, uint8_t color_mask)
+{
+    int32_t dx;
+    int32_t dy;
+
+    s_test_shape = shape;
+    s_test_phase = 0;
+    test_shape_point(shape, 0, color_mask, &s_test_to_x, &s_test_to_y);
+    s_test_from_x = s_test_last_x;
+    s_test_from_y = s_test_last_y;
+
+    dx = s_test_to_x - s_test_from_x;
+    dy = s_test_to_y - s_test_from_y;
+    if (dx < 0) dx = -dx;
+    if (dy < 0) dy = -dy;
+
+    s_test_move_len = (uint32_t)((dx > dy ? dx : dy) / TEST_SWITCH_STEP) + 1u;
+    s_test_move_pos = 0;
+}
+
 static void build_test_samples(int16_t samples[RP_STREAM_SAMPLES_PER_PACKET][RP_SAMPLE_CHANNELS])
 {
-    const rp_test_shape_t shape = s_test_shape;
     const uint8_t color_mask = s_test_color_mask & 0x07;
 
     for (int s = 0; s < RP_STREAM_SAMPLES_PER_PACKET; s++) {
-        uint32_t p = s_test_phase + (uint32_t)s;
         int32_t x = 0;
         int32_t y = 0;
-        bool blanked = false;
-        uint8_t bits = color_mask;
+        uint8_t bits = 0;
 
-        if (shape == RP_TEST_SHAPE_BEAM) {
-            x = 0;
-            y = 0;
-        } else if (shape == RP_TEST_SHAPE_COLOR_SHIFT) {
-            bits = color_shift_point(p, color_mask, &x, &y);
-            blanked = bits == 0;
-        } else if (shape == RP_TEST_SHAPE_CIRCLE) {
-            const int32_t r = 32767;
-            const uint32_t rr = (uint32_t)(r * r);
-            uint32_t t = p % 1024;
-            uint32_t q = t & 255u;
-            int32_t v = r - (int32_t)((q * (uint32_t)r) / 255u);
-            int32_t h = (int32_t)isqrt_u32(rr - (uint32_t)(v * v));
-
-            if (t < 256u) {
-                x = v;
-                y = h;
-            } else if (t < 512u) {
-                x = -h;
-                y = v;
-            } else if (t < 768u) {
-                x = -v;
-                y = -h;
-            } else {
-                x = h;
-                y = -v;
-            }
-        } else if (shape == RP_TEST_SHAPE_CROSS) {
-            uint32_t t = p % 1024;
-
-            if (t < 448u) {
-                line_point(-32768, 0, 32767, 0, t, 447u, &x, &y);
-            } else if (t < 512u) {
-                blanked = true;
-                line_point(32767, 0, 0, -32768, t - 448u, 63u, &x, &y);
-            } else if (t < 960u) {
-                line_point(0, -32768, 0, 32767, t - 512u, 447u, &x, &y);
-            } else {
-                blanked = true;
-                line_point(0, 32767, -32768, 0, t - 960u, 63u, &x, &y);
-            }
-        } else if (shape == RP_TEST_SHAPE_HEART) {
-            uint32_t t = p % 1536;
-            uint32_t seg = t / 256u;
-            uint32_t q = t & 255u;
-
-            switch (seg) {
-            case 0:
-                line_point(0, 12000, -21000, 30000, q, 255u, &x, &y);
-                break;
-            case 1:
-                line_point(-21000, 30000, -32768, 5000, q, 255u, &x, &y);
-                break;
-            case 2:
-                line_point(-32768, 5000, 0, -32768, q, 255u, &x, &y);
-                break;
-            case 3:
-                line_point(0, -32768, 32767, 5000, q, 255u, &x, &y);
-                break;
-            case 4:
-                line_point(32767, 5000, 21000, 30000, q, 255u, &x, &y);
-                break;
-            default:
-                line_point(21000, 30000, 0, 12000, q, 255u, &x, &y);
-                break;
-            }
-        } else {
-            uint32_t t = p % 1280;
-
-            if (t < 256u) {
-                line_point(-32768, -32768, 32767, -32768, t, 255u, &x, &y);
-            } else if (t < 512u) {
-                line_point(32767, -32768, 32767, 32767, t - 256u, 255u, &x, &y);
-            } else if (t < 768u) {
-                line_point(32767, 32767, -32768, 32767, t - 512u, 255u, &x, &y);
-            } else if (t < 1024u) {
-                line_point(-32768, 32767, -32768, -32768, t - 768u, 255u, &x, &y);
-            } else {
-                blanked = true;
-                line_point(-32768, -32768, -32768, -32768, t - 1024u, 255u, &x, &y);
-            }
+        if (s_test_switch_pending) {
+            s_test_switch_pending = false;
+            test_switch_begin(s_test_next_shape, color_mask);
         }
+
+        if (s_test_move_pos < s_test_move_len + TEST_SWITCH_DWELL) {
+            uint32_t pos = s_test_move_pos < s_test_move_len ? s_test_move_pos : s_test_move_len;
+            line_point(s_test_from_x, s_test_from_y, s_test_to_x, s_test_to_y,
+                       pos, s_test_move_len, &x, &y);
+            s_test_move_pos++;
+        } else {
+            bits = test_shape_point(s_test_shape, s_test_phase, color_mask, &x, &y);
+            s_test_phase++;
+        }
+
+        s_test_last_x = x;
+        s_test_last_y = y;
 
         samples[s][0] = clamp_i16(x);
         samples[s][1] = clamp_i16(y);
-        samples[s][2] = (!blanked && (bits & 0x01)) ? 32767 : -32768;
-        samples[s][3] = (!blanked && (bits & 0x02)) ? 32767 : -32768;
-        samples[s][4] = (!blanked && (bits & 0x04)) ? 32767 : -32768;
-        samples[s][5] = (!blanked && bits) ? 32767 : -32768;
+        samples[s][2] = (bits & 0x01) ? 32767 : -32768;
+        samples[s][3] = (bits & 0x02) ? 32767 : -32768;
+        samples[s][4] = (bits & 0x04) ? 32767 : -32768;
+        samples[s][5] = bits ? 32767 : -32768;
         for (int ch = 6; ch < RP_SAMPLE_CHANNELS; ch++) {
             samples[s][ch] = 0;
         }
     }
-
-    s_test_phase += RP_STREAM_SAMPLES_PER_PACKET;
 }
 
 static esp_err_t payload_spi_start(void)
@@ -1005,6 +1072,7 @@ esp_err_t rp_manager_start(void)
     char resp[128];
 
     s_output_ref = 0;
+    s_test_holds_output = false;
     rate_limit_load();
 
     xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
@@ -1174,6 +1242,7 @@ esp_err_t rp_manager_output_force_stop(void)
     xSemaphoreTake(s_rp_mutex, portMAX_DELAY);
 
     s_output_ref = 0;
+    s_test_holds_output = false;
     wait_payload_tx_idle();
     esp_err_t ret = uart_cmd_locked("STOP", resp, sizeof(resp));
     if (ret == ESP_OK) {
@@ -1396,6 +1465,7 @@ esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,
         s_status.remote_buffer_low_water_samples = low_water_samples;
         s_status.remote_running = false;
         s_output_ref = 0;
+        s_test_holds_output = false;
         ret = ESP_OK;
     } else if (ret == ESP_OK) {
         ret = ESP_ERR_INVALID_RESPONSE;
@@ -1456,15 +1526,20 @@ esp_err_t rp_manager_start_test_stream(void)
 esp_err_t rp_manager_start_test_shape(rp_test_shape_t shape)
 {
     if (s_test_stream_task) {
-        s_test_shape = shape;
-        s_test_phase = 0;
+        /* Running: the generator moves to the new shape blanked. */
+        s_test_next_shape = shape;
+        s_test_switch_pending = true;
         s_test_stream_requested = true;
         s_status.test_stream_running = true;
         return ESP_OK;
     }
 
+    /* Fresh start: START's own blanked ramp reaches the first point. */
+    s_test_switch_pending = false;
     s_test_shape = shape;
     s_test_phase = 0;
+    s_test_move_len = 0;
+    s_test_move_pos = TEST_SWITCH_DWELL;
     s_test_stream_requested = true;
     s_status.test_stream_running = true;
 
@@ -1484,7 +1559,12 @@ esp_err_t rp_manager_start_test_shape(rp_test_shape_t shape)
         return ESP_ERR_NO_MEM;
     }
 
-    return rp_manager_output_start();
+    /* Held until rp_manager_stop_test_stream(), even if START failed. */
+    s_test_holds_output = true;
+    esp_err_t ret = rp_manager_output_start();
+    ESP_LOGI(TAG, "test stream start: shape %d, output ref %d, START %s",
+             (int)shape, s_output_ref, esp_err_to_name(ret));
+    return ret;
 }
 
 void rp_manager_set_test_color_mask(uint8_t mask)
@@ -1503,7 +1583,27 @@ esp_err_t rp_manager_stop_test_stream(void)
         waited_ms += 10;
     }
 
-    return s_test_stream_task ? ESP_ERR_TIMEOUT : ESP_OK;
+    if (s_test_stream_task) {
+        ESP_LOGW(TAG, "test stream stop: task still running after %lu ms", (unsigned long)waited_ms);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    /*
+       Give back the output the pattern took, so the RP stops (parked,
+       blanked) unless another producer still holds it.
+    */
+    if (s_test_holds_output) {
+        s_test_holds_output = false;
+        int ref_before = s_output_ref;
+        esp_err_t ret = rp_manager_output_stop();
+        ESP_LOGI(TAG, "test stream stop: waited %lu ms, output ref %d -> %d, STOP %s",
+                 (unsigned long)waited_ms, ref_before, s_output_ref, esp_err_to_name(ret));
+        return ret;
+    }
+
+    ESP_LOGI(TAG, "test stream stop: waited %lu ms, no output held (ref %d)",
+             (unsigned long)waited_ms, s_output_ref);
+    return ESP_OK;
 }
 
 void rp_manager_get_status(rp_status_t *status)
