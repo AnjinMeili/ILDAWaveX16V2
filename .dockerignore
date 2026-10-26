@@ -1,0 +1,9 @@
+**
+!docker/
+!docker/esp32/
+!docker/esp32/Dockerfile
+!docker/esp32/build.sh
+!docker/rp2354/
+!docker/rp2354/Dockerfile
+!docker/rp2354/build.sh
+!docker/rp2354/inspect-uf2.cjs

@@ -27,19 +27,36 @@ ILDAWaveX16/
 │   ├── ESP32S3/      # ESP32-S3 FW: networking, web UI, SD, protocols
 │   └── RP2354/       # RP2354 FW: real-time DAC output engine
 ├── hardware/         # schematic, 3D model
-├── tools/            # scripts for protocol testing
+├── docker/           # ESP and RP builder images
+├── docs/             # build guides and hardware notes
+├── tools/            # build, cleanup, and protocol-testing scripts
 └── README.md
 ```
 
 > [!NOTE]
-> The ESP32-S3 firmware is also compatible with the original **ILDAWaveX16 V1** board. To build for V1, set `BOARD_VERSION` to `1` in `ESP32S3/main/CMakeLists.txt`.
+> The ESP32-S3 firmware is also compatible with the original **ILDAWaveX16 V1** board. To build for V1, use `./tools/build-firmware.sh esp32 --board-version 1` or set `BOARD_VERSION` to `1` in `firmware/ESP32S3/main/CMakeLists.txt` for an IDE build.
 > Performance on V1 is currently more limited than on V2, so please treat V1 support as experimental.
 
 ---
 
 ## Firmware Development Setup
 
-Recommended development tools:
+### Docker builds
+
+The Docker builders keep ESP-IDF, the Pico SDK, and both toolchains inside containers. With Docker installed, run these Bash commands from the repository root:
+
+```bash
+./tools/build-firmware.sh esp32   # ESP32-S3 firmware for V2
+./tools/build-firmware.sh rp2354  # RP2354 firmware
+```
+
+Each command builds its image and firmware, then exports to `dist/esp32-v2/artifacts/` or `dist/rp2354/artifacts/`. Repeating a command replaces the previous artifacts only after a successful build. Use `./tools/clean-build.sh all` to remove generated firmware artifacts.
+
+See the [ESP build guide](docs/building.md) and [RP build guide](docs/building-rp2354.md) for requirements, V1 builds, Windows PowerShell commands, caching, and artifact details. Browser flashing instructions are in the [ESP](#flashing-esp32-s3) and [RP](#flashing-rp2354) sections below.
+
+### IDE builds
+
+For development with host-installed SDKs:
 
 - [Visual Studio Code](https://code.visualstudio.com/)
 - [ESP-IDF Extension for VS Code](https://marketplace.visualstudio.com/items?itemName=espressif.esp-idf-extension) for the ESP32-S3 firmware
@@ -102,32 +119,50 @@ Each microcontroller must be flashed separately.
 
 ### Flashing ESP32-S3
 
-If building from source, use the ESP-IDF extension in VS Code.
+If building from source, use the [ESP Docker builder](docs/building.md) or the ESP-IDF extension in VS Code.
 
-Before building, choose the target board version in: `ESP32S3/main/CMakeLists.txt`
+Select the board version using the Docker builder's `--board-version` option or in `firmware/ESP32S3/main/CMakeLists.txt` for an IDE build.
 
-If flashing a released firmware image, use the [web flasher](https://stanleyprojects.com/projects/ildawavex16v2/install/index.html).
+**Released firmware:** Use the project's [release web installer](https://stanleyprojects.com/projects/ildawavex16v2/install/index.html), which provides preset firmware images.
+
+**Local builds:** Use Espressif's [ESP Web Tool](https://espressif.github.io/esptool-js/) in Chrome or Edge:
+
+1. Connect to the board's ESP USB connection, close other serial terminals, and connect to its serial port in the browser.
+2. Open `flasher_args.json` from `dist/esp32-v2/artifacts/` (or `dist/esp32-v1/artifacts/` for V1).
+3. Add a file row for every entry in `flash_files`, selecting the corresponding local binary and entering its hexadecimal address. Paths are relative to the artifact directory; the JSON itself is not a firmware file to upload.
+4. Match the tool's flash mode, frequency, and size to `flash_settings`, then start programming and wait for completion. Reset the ESP if it does not restart automatically.
+
+The current layout uses `bootloader/bootloader.bin` at `0x0`, `partition_table/partition-table.bin` at `0x8000`, and `ILDAWaveX16V2-ESP32S3.bin` at `0x10000`. Always use the values from your build's JSON rather than assuming these offsets. The application binary alone is not a complete factory image. A full-chip erase is not required by this procedure and would remove stored settings.
 
 The ESP32-S3 should normally enter bootloader mode automatically. If flashing does not start:
 
 1. Hold `ESP BOOT`
 2. Briefly press and release `ESP RST`
-3. Try flashing again
+3. Release `ESP BOOT` and try flashing again
 
 ---
 
 ### Flashing RP2354
 
-If building from source, use the Raspberry Pi Pico extension in VS Code.
+Use a released `.uf2` or build with the [RP Docker builder](docs/building-rp2354.md) or Raspberry Pi Pico extension in VS Code. Docker builds export `dist/rp2354/artifacts/ILDAWaveX16V2-RP2350.uf2`.
 
-If flashing a released firmware image, enter bootloader mode:
+Connect the board's RP USB connection to your computer with a data-capable cable, then enter bootloader mode:
 
 1. Hold `RP BOOT`
-2. Briefly press and release `RP RST`
+2. Briefly press and release `RP RST` while holding `RP BOOT`
+3. Release `RP BOOT`
 
-The RP2354 should mount as a storage drive.
+The RP2354 should appear as a USB storage drive. Choose either flashing method:
 
-Copy the `.uf2` firmware file onto the drive. It will automatically unmount and reboot into the new firmware.
+**Browser:** Open the third-party [pico⚡flash](https://picoflash.org/) in Chrome or Edge. Click **Connect**, select the RP bootloader device, then select the `.uf2` in the **Flash** tab and click **Flash Device**. Keep USB connected until it reports success. If needed, click **Reboot** or press `RP RST` with `RP BOOT` released. See the tool's [platform requirements](https://github.com/piersfinlayson/picoflash).
+
+**Mounted drive:** Copy the `.uf2` onto the RP storage drive. It should automatically unmount and reboot into the new firmware.
+
+If WebUSB cannot connect, close other USB tools and re-enter the bootloader, or use the mounted-drive method. Use the original UF2 file; no manual address or binary conversion is needed.
+
+After flashing, refresh the ESP web interface and check the RP connection and firmware version. Builds with the same version cannot be distinguished by that version alone.
+
+For firmware that provides USB logs, open the [Web Serial terminal](https://googlechromelabs.github.io/serial-terminal/) in Chrome or Edge, select the RP serial port, and connect at 115200 baud with hardware flow control disabled. The RP must be running normally, with the flasher disconnected.
 
 ---
 
