@@ -27,19 +27,36 @@ ILDAWaveX16/
 │   ├── ESP32S3/      # ESP32-S3 FW: networking, web UI, SD, protocols
 │   └── RP2354/       # RP2354 FW: real-time DAC output engine
 ├── hardware/         # schematic, 3D model
-├── tools/            # scripts for protocol testing
+├── docker/           # ESP and RP builder images
+├── docs/             # build guides and hardware notes
+├── tools/            # build, cleanup, and protocol-testing scripts
 └── README.md
 ```
 
 > [!NOTE]
-> The ESP32-S3 firmware is also compatible with the original **ILDAWaveX16 V1** board. To build for V1, set `BOARD_VERSION` to `1` in `ESP32S3/main/CMakeLists.txt`.
+> The ESP32-S3 firmware is also compatible with the original **ILDAWaveX16 V1** board. To build for V1, use `./tools/build-firmware.sh esp32 --board-version 1` or set `BOARD_VERSION` to `1` in `firmware/ESP32S3/main/CMakeLists.txt` for an IDE build.
 > Performance on V1 is currently more limited than on V2, so please treat V1 support as experimental.
 
 ---
 
 ## Firmware Development Setup
 
-Recommended development tools:
+### Docker builds
+
+The Docker builders keep ESP-IDF, the Pico SDK, and both toolchains inside containers. With Docker installed, run these Bash commands from the repository root:
+
+```bash
+./tools/build-firmware.sh esp32   # ESP32-S3 firmware for V2
+./tools/build-firmware.sh rp2354  # RP2354 firmware
+```
+
+Each command builds its image and firmware, then exports to `dist/esp32-v2/artifacts/` or `dist/rp2354/artifacts/`. Repeating a command replaces the previous artifacts only after a successful build. Use `./tools/clean-build.sh all` to remove generated firmware artifacts.
+
+See the [ESP build guide](docs/building.md) and [RP build guide](docs/building-rp2354.md) for requirements, V1 builds, Windows PowerShell commands, caching, and artifact details. Browser flashing instructions are in the [ESP](#flashing-esp32-s3) and [RP](#flashing-rp2354) sections below.
+
+### IDE builds
+
+For development with host-installed SDKs:
 
 - [Visual Studio Code](https://code.visualstudio.com/)
 - [ESP-IDF Extension for VS Code](https://marketplace.visualstudio.com/items?itemName=espressif.esp-idf-extension) for the ESP32-S3 firmware

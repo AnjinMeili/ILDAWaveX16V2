@@ -117,4 +117,4 @@ chmod 755 "$export_stage"
 mv -T "$export_stage" /out/artifacts
 export_stage=
 
-printf 'Exported RP artifacts to /out/artifacts; physical flash layout remains unvalidated.\n'
+printf 'Exported RP artifacts to /out/artifacts\n'
