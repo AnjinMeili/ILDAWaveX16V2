@@ -686,6 +686,30 @@ esp_err_t rp_manager_clear_buffer(void)
     return ret;
 }
 
+/*
+   Drop samples a producer queued but never STARTed, so the next START does
+   not play them. Does nothing while another producer holds the output,
+   since its samples share the same ring. The push mutex keeps a producer
+   from writing while the ring is reset.
+*/
+esp_err_t rp_manager_output_discard_unstarted(void)
+{
+    if (!s_mutex || !s_push_mutex) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+
+    if (s_output_ref == 0) {
+        xSemaphoreTake(s_push_mutex, portMAX_DELAY);
+        ring_clear();
+        xSemaphoreGive(s_push_mutex);
+    }
+
+    xSemaphoreGive(s_mutex);
+    return ESP_OK;
+}
+
 esp_err_t rp_manager_set_rate(uint32_t rate_hz)
 {
     if (rate_hz < 1)      rate_hz = 1;
