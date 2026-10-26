@@ -85,9 +85,6 @@ for extension in uf2 elf bin elf.map; do
     cp "build/$file" "$bundle/"
 done
 
-read -r flash_origin flash_size < <(awk '$1 == "FLASH" && $2 ~ /^0x/ {print $2, $3; exit}' build/ILDAWaveX16V2-RP2350.elf.map) \
-    || fail 'Cannot read linked FLASH bounds from the map file.'
-node /usr/local/lib/inspect-uf2.cjs "$bundle/ILDAWaveX16V2-RP2350.uf2" "$flash_origin" "$flash_size" > "$bundle/uf2-info.json"
 picotool info -a "$bundle/ILDAWaveX16V2-RP2350.uf2" > "$bundle/picotool-info.txt"
 
 cp build/CMakeCache.txt "$bundle/"
@@ -102,7 +99,7 @@ cp "$workspace/input-sha256.txt" "$bundle/"
     picotool version
     cmake --version
     ninja --version
-    sha256sum /usr/local/bin/build-firmware /usr/local/lib/inspect-uf2.cjs
+    sha256sum /usr/local/bin/build-firmware
 } > "$bundle/build-info.txt"
 
 (

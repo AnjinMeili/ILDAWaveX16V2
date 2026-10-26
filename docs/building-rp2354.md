@@ -87,11 +87,10 @@ Compilation/export validation failure returns nonzero without publishing an arti
 
 - `ILDAWaveX16V2-RP2350.uf2`, `.bin`, `.elf`, and `.elf.map` retain the existing CMake project name.
 - `CMakeCache.txt` records generated build configuration.
-- `uf2-info.json` reports linked flash bounds, application family/address range, and separate RP2350-E10 compatibility blocks.
 - `picotool-info.txt` records picotool's inspection of the UF2 file.
 - `input-sha256.txt`, `build-info.txt`, and `SHA256SUMS` identify inputs, tool versions, and exported contents.
 
-The UF2 inspector checks block structure, application family, numbering, order, and application addresses against the linker's FLASH region. It reports RP2350-E10 compatibility blocks separately. The build command exports files without flashing the board.
+The builder checks that firmware artifacts are nonempty and runs `picotool info` on the UF2 before exporting. It does not flash the board.
 
 Verify the export on Linux:
 

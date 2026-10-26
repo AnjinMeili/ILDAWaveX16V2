@@ -11,7 +11,6 @@ RUN apt-get update \
         git \
         libusb-1.0-0-dev \
         ninja-build \
-        nodejs \
         pkg-config \
         python3 \
         xz-utils \
@@ -66,7 +65,6 @@ RUN groupadd --gid 10001 builder \
     && useradd --uid 10001 --gid builder --create-home builder
 
 COPY --chmod=755 docker/rp2354/build.sh /usr/local/bin/build-firmware
-COPY docker/rp2354/inspect-uf2.cjs /usr/local/lib/inspect-uf2.cjs
 
 USER builder
 WORKDIR /tmp
