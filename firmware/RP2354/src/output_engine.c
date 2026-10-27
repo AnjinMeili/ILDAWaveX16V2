@@ -992,6 +992,7 @@ uint32_t output_engine_get_lit_jumps(output_lit_jump_t *out, uint32_t max, uint3
         out[n++] = s_lit_jumps[s % OUTPUT_LIT_JUMP_LOG];
     }
 
-    *serial = latest;
+    /* Entries that did not fit are read on the next call. */
+    *serial = first + n - 1u;
     return n;
 }
