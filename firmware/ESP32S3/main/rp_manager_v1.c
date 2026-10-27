@@ -897,6 +897,11 @@ esp_err_t rp_manager_start_test_stream(void)
 
 esp_err_t rp_manager_start_test_shape(rp_test_shape_t shape)
 {
+    /* No colour delay line on V1, so nothing for this pattern to calibrate. */
+    if (shape == RP_TEST_SHAPE_COLOR_SHIFT) {
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
     s_test_shape = shape;
     s_test_phase = 0;
     s_test_stream_requested = true;
