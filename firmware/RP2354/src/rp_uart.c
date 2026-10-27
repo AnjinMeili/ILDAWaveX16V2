@@ -63,19 +63,59 @@ static bool parse_u32_arg(const char *line, const char *key, uint32_t *out)
 /* A SHIFT applied while running is not in flash until SHIFT save. */
 static bool s_color_shift_unsaved = false;
 
-static void save_current_settings(void)
+/* LIMIT or MIRROR changed while output ran; written after the next STOP/CLEAR. */
+static bool s_settings_pending = false;
+
+/*
+   A flash write pauses the output core, so callers only save while output
+   is stopped. The colour shift is written only by a SHIFT save; any other
+   save keeps the saved one, so a value still being tried stays unsaved.
+*/
+static void save_current_settings(bool include_color_shift)
 {
     rp_settings_t settings;
+
+    rp_settings_get(&settings);
 
     settings.buffer_size_samples       = ring_get_capacity();
     settings.buffer_high_water_samples = ring_get_high_water();
     settings.buffer_low_water_samples  = ring_get_low_water();
     output_engine_get_mirror(&settings.mirror_x, &settings.mirror_y);
     settings.max_rate_hz = output_engine_get_max_rate();
-    settings.color_shift_us = output_engine_get_color_shift();
+
+    if (include_color_shift || !s_color_shift_unsaved) {
+        settings.color_shift_us = output_engine_get_color_shift();
+    }
 
     if (rp_settings_save(&settings)) {
-        s_color_shift_unsaved = false;
+        s_settings_pending = false;
+        if (include_color_shift) {
+            s_color_shift_unsaved = false;
+        }
+    }
+}
+
+/* Save now if stopped, else after the next STOP/CLEAR. Returns true if saved now. */
+static bool save_or_defer_settings(void)
+{
+    output_engine_status_t out;
+
+    output_engine_get_status(&out);
+
+    if (out.running) {
+        s_settings_pending = true;
+        return false;
+    }
+
+    save_current_settings(false);
+    return true;
+}
+
+static void save_pending_settings(void)
+{
+    if (s_settings_pending) {
+        save_current_settings(false);
+        rp_log("settings=SAVED deferred");
     }
 }
 
@@ -196,6 +236,7 @@ static void handle_line(char *line)
         output_engine_stop_safe();
         rp_log("command=STOP output=PARKED xy=center channels=0V");
         uart_send_line("OK STOP");
+        save_pending_settings();
         return;
     }
 
@@ -203,6 +244,7 @@ static void handle_line(char *line)
         output_engine_stop_safe();
         rp_log("command=CLEAR output=PARKED ring=cleared");
         uart_send_line("OK CLEAR");
+        save_pending_settings();
         return;
     }
 
@@ -230,13 +272,14 @@ static void handle_line(char *line)
         parse_u32_arg(line, "max_rate=", &max_rate);
 
         output_engine_set_max_rate(max_rate);
-        save_current_settings();
+        bool saved = save_or_defer_settings();
 
         output_engine_status_t out;
         output_engine_get_status(&out);
-        rp_log("command=LIMIT max_rate=%lu applied_rate=%lu",
+        rp_log("command=LIMIT max_rate=%lu applied_rate=%lu saved=%u",
                (unsigned long)out.max_rate_hz,
-               (unsigned long)out.sample_rate_hz);
+               (unsigned long)out.sample_rate_hz,
+               saved ? 1u : 0u);
 
         char reply[48];
         snprintf(reply, sizeof(reply), "OK LIMIT %lu", (unsigned long)out.max_rate_hz);
@@ -267,7 +310,7 @@ static void handle_line(char *line)
         }
 
         if (!out.running && s_color_shift_unsaved) {
-            save_current_settings();
+            save_current_settings(true);
         }
 
         output_engine_get_status(&out);
@@ -294,7 +337,7 @@ static void handle_line(char *line)
 
         output_engine_stop_safe();
         ring_configure(size, high_water, low_water);
-        save_current_settings();
+        save_current_settings(false);
         rp_log("command=BUFFER size=%lu high_water=%lu low_water=%lu output=PARKED",
                (unsigned long)ring_get_capacity(),
                (unsigned long)ring_get_high_water(),
@@ -312,10 +355,11 @@ static void handle_line(char *line)
         parse_u32_arg(line, "y=", &vy);
 
         output_engine_set_mirror(vx != 0, vy != 0);
-        save_current_settings();
-        rp_log("command=MIRROR x=%lu y=%lu",
+        bool saved = save_or_defer_settings();
+        rp_log("command=MIRROR x=%lu y=%lu saved=%u",
                (unsigned long)(vx != 0),
-               (unsigned long)(vy != 0));
+               (unsigned long)(vy != 0),
+               saved ? 1u : 0u);
 
         uart_send_line("OK MIRROR");
         return;
