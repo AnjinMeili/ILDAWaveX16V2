@@ -25,11 +25,14 @@ from ilw_sender import load_ilda  # noqa: E402
 FULL_SCALE = 65535.0
 
 
-def frame_stats(points, big_pct: float) -> dict:
+def frame_stats(points, big_pct: float, prev=None) -> dict:
+    """prev is the point played just before this frame; its step into the
+    frame counts, but it is not one of the frame's points."""
     lit_max = blank_max = 0
     lit_big = blank_big = 0
     blanked = 0
-    for a, b in zip(points, points[1:]):
+    seq = [prev] + points if prev is not None else points
+    for a, b in zip(seq, seq[1:]):
         step = max(abs(b.x - a.x), abs(b.y - a.y))
         pct = step * 100.0 / FULL_SCALE
         if b.blanked:
@@ -77,8 +80,14 @@ def main() -> int:
         totals = {"points": 0, "lit_big_steps": 0, "blank_big_steps": 0}
         lit_max = blank_max = extent = 0.0
         blanked_pts = 0
+        # The SD player plays frames back to back and loops the file, so the
+        # first frame follows the last one.
+        filled = [fr for fr in frames if fr.points]
+        prev = filled[-1].points[-1] if filled else None
         for i, fr in enumerate(frames):
-            st = frame_stats(fr.points, args.big)
+            st = frame_stats(fr.points, args.big, prev)
+            if fr.points:
+                prev = fr.points[-1]
             totals["points"] += st["points"]
             totals["lit_big_steps"] += st["lit_big_steps"]
             totals["blank_big_steps"] += st["blank_big_steps"]
