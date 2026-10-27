@@ -246,6 +246,44 @@ drop counter and the RP's sequence counter both stayed at 0. IDN is UDP, so
 the W5500's receive buffer or the network are the candidates. Next step:
 count gaps in the IDN packet sequence numbers on the ESP32.
 
+### F18. Review of PR #9: flash writes, the park start, limit changes. Fixed+verified (2026-10-27).
+An automated review of the pull request raised 12 points; all were real.
+They come from five causes, each fixed where it starts:
+
+- **Settings written to flash while playing (high).** LIMIT (and MIRROR,
+  upstream) wrote RP flash at once; the write pauses the output core, so
+  the DAC could hold a lit sample in place for its length. LIMIT and MIRROR
+  now apply at once and are written after the next STOP or CLEAR, with the
+  scanners parked. Measured: changes during a 30k pattern logged
+  `saved=0` with 0 underruns; the write ran 36 ms after the STOP reply.
+  Colour shift keeps its own Save: a value being tried stays unsaved
+  through other saves (checked across an RP reboot).
+- **Park ramp could start from an unplayed point.** A batch skipped by STOP
+  still recorded its end as the scanner position. The position is now
+  recorded only with the DAC write. The window cannot be hit on purpose;
+  the 20-stop cycle still passes.
+- **A limit change did not reach the running rate.** A higher limit left a
+  clamped IDN stream slow; a lower one left Ether Dream's status and fill
+  estimate on the old rate; V1 could run up to 500 pps over a lowered
+  limit; a failed push still said "Saved and applied". The rate manager now
+  keeps the rate each producer asked for and re-applies it under every new
+  limit; Ether Dream reads the running rate from it. Measured: Ether Dream
+  30k -> 20k and 20k -> 30k mid-stream, the client told the new rate within
+  0.5 s, 0 NAKs; IDN 20k -> 30k after raising the limit, 0 drops.
+- **Tools and page trusted a stale status.** A failed refresh answers
+  HTTP 200 "ERR ...". hwtest and the page now require "OK"; hwtest takes
+  its galvo maximum from the board's limit and refuses a higher one.
+- **Smaller:** V1 refuses the Colour Shift pattern (it drew a full-scale
+  square); colour shift Save stops when Apply fails; the RP lit-jump log
+  keeps entries a reader had no room for; `ild_inspect` counts steps
+  between frames and at the file loop.
+
+The owner then ran Modulaser over IDN (40k, 30k, 20k) and Ether Dream
+(20k to 50k); every rate change reached the RP. Two observations outside
+these fixes are open items: lit jumps for 12 s after the first IDN switch
+from 40k to 30k (not reproduced on a repeat), and an Ether Dream ceiling
+near 40k points/s.
+
 ### Owner's verification, same evening
 With both 0.2.0 firmwares and Modulaser over IDN: test frames "dead exact
 on"; the stream held at 28.9k, 40k, 45k and 50k (50k judged to be pushing
@@ -463,6 +501,15 @@ when parked), ILW moved off the RP BUFFER command.
 - F17: find where IDN loses about a second of points in some runs.
 - `ed-rate-change` still sees one second of underruns at the 30k to 20k
   switch; the 1.2 s client stall it used to show went with F16.
+- Modulaser over IDN, first switch from 40k to 30k after connecting: the
+  RP buffer filled to the top within 2 s and 2 to 3 lit jumps per second
+  appeared at packet boundaries for 12 s (no RP underruns, SPI drops or
+  sequence gaps). Not reproduced on a repeat with the buffer already full.
+  Next: read the IDN drop counter across the switch.
+- Ether Dream tops out near 40k points/s (Modulaser at 45k and 50k played
+  39.6k and 38.5k; 0 underruns up to 33k; the earlier build was at the
+  edge at 40k). Likely the TCP window (11,520 bytes, 640 points) over the
+  board's round trip; `ED_DIAG` would show the receive and wait times.
 - Confirm the DAC80508 variant (Z or M) from the chip marking; it decides
   what the outputs do between power-on and the first park write.
 - Isolate F8: re-run `idn-packet-size` after long uptime and after heavy
