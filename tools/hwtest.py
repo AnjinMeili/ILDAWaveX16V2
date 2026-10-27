@@ -52,12 +52,18 @@ def api(host: str, path: str, method: str = "GET") -> str:
 def status(host: str, refresh: bool = False) -> dict:
     """Board status. refresh=True forces a fresh STATUS read from the RP first."""
     if refresh:
-        api(host, "/api/scan/refresh", "POST")
+        # A failed read still answers HTTP 200, with "ERR ..." as the body.
+        reply = api(host, "/api/scan/refresh", "POST").strip()
+        if not reply.startswith("OK"):
+            raise RuntimeError(f"status refresh failed: {reply}")
     return json.loads(api(host, "/api/rp/status"))
 
 
 def require_idle(host: str) -> dict:
-    s = status(host, refresh=True)
+    try:
+        s = status(host, refresh=True)
+    except (OSError, RuntimeError) as exc:
+        raise SystemExit(f"refusing to test: cannot read the board state ({exc})")
     busy = [k for k in ("remote_running", "ilda_running", "test_stream_running") if s.get(k)]
     if busy:
         raise SystemExit(f"refusing to test: output already active ({', '.join(busy)})")
@@ -747,7 +753,8 @@ class Ctx:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="ildawavex16v2.local")
-    ap.add_argument("--galvo-max", type=int, default=50000, help="galvo rating in pps (default 50000)")
+    ap.add_argument("--galvo-max", type=int, default=None,
+                    help="galvo rating in pps (default: the board's scanner limit; may not exceed it)")
     ap.add_argument("--repeat", type=int, default=20, help="runs for the repeated tests (default 20)")
     ap.add_argument("--log", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "logs",
                                                   time.strftime("hwtest-%Y%m%d.jsonl")))
@@ -764,7 +771,16 @@ def main() -> int:
     if unknown:
         raise SystemExit(f"unknown tests: {unknown}; see 'list'")
 
-    ctx = Ctx(args.host, args.galvo_max, args.repeat)
+    # Test rates come from the board's own limit, so a 30k board is not
+    # sent 50k and then marked as losing data.
+    board_limit = int(require_idle(args.host)["rate_limit"])
+    galvo_max = board_limit if args.galvo_max is None else args.galvo_max
+    if galvo_max > board_limit:
+        raise SystemExit(f"--galvo-max {galvo_max} is above the board's scanner limit {board_limit}; "
+                         "raise the limit in the web UI first if the scanners are rated for it")
+    print(f"galvo max {galvo_max} pps (board scanner limit {board_limit})")
+
+    ctx = Ctx(args.host, galvo_max, args.repeat)
     os.makedirs(os.path.dirname(args.log), exist_ok=True)
     failed = []
     for name in names:
