@@ -256,7 +256,7 @@ static esp_err_t push_rate_limit_locked(uint32_t limit_hz);
 
 static esp_err_t refresh_status_locked(void)
 {
-    static char resp[640];   /* under s_rp_mutex; STATUS is long */
+    static char resp[768];   /* under s_rp_mutex; STATUS is long */
 
     esp_err_t ret = uart_cmd_locked("STATUS", resp, sizeof(resp));
     if (ret != ESP_OK) {
@@ -361,6 +361,18 @@ parse_status:
 
     if (parse_u32_key(resp, "stale_packets=", &v)) {
         s_status.remote_stale_packets = v;
+    }
+
+    if (parse_u32_key(resp, "seq_gaps=", &v)) {
+        s_status.remote_seq_gaps = v;
+    }
+
+    if (parse_u32_key(resp, "seq_missing=", &v)) {
+        s_status.remote_seq_missing = v;
+    }
+
+    if (parse_u32_key(resp, "rx_partial=", &v)) {
+        s_status.remote_rx_partial = v;
     }
 
     int32_t sv = 0;
@@ -712,6 +724,20 @@ static void build_test_samples(int16_t samples[RP_STREAM_SAMPLES_PER_PACKET][RP_
     }
 }
 
+/*
+   Falling edges on READY, counted in hardware-latched GPIO interrupts. The
+   RP drops READY once a packet is in and raises it again as soon as it is
+   ready for the next, so the low time can be shorter than this task is held
+   off by others; polling the level then missed it and stalled 100 ms.
+*/
+static volatile uint32_t s_ready_falls = 0;
+
+static void IRAM_ATTR ready_fall_isr(void *arg)
+{
+    (void)arg;
+    s_ready_falls++;
+}
+
 static esp_err_t payload_spi_start(void)
 {
     spi_bus_config_t bus_cfg = {
@@ -733,10 +759,15 @@ static esp_err_t payload_spi_start(void)
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_DISABLE,
         .pull_down_en = GPIO_PULLDOWN_ENABLE,
-        .intr_type = GPIO_INTR_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE,
     };
 
     ret = gpio_config(&ready_io);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    ret = gpio_isr_handler_add(RP_MISO_GPIO, ready_fall_isr, NULL);
     if (ret != ESP_OK) {
         return ret;
     }
@@ -788,18 +819,19 @@ static esp_err_t wait_rp_ready_high(uint32_t timeout_us)
     return ESP_ERR_TIMEOUT;
 }
 
-static esp_err_t wait_rp_ready_low(uint32_t timeout_us)
+/* Wait for READY to fall after `falls` edges had been counted. */
+static esp_err_t wait_rp_ready_fall(uint32_t falls, uint32_t timeout_us)
 {
     int64_t deadline = esp_timer_get_time() + timeout_us;
 
     while (esp_timer_get_time() < deadline) {
-        if (!gpio_get_level(RP_MISO_GPIO)) {
+        if (s_ready_falls != falls) {
             return ESP_OK;
         }
 
         for (int i = 0; i < 100; i++) {
             esp_rom_delay_us(2);
-            if (!gpio_get_level(RP_MISO_GPIO)) {
+            if (s_ready_falls != falls) {
                 return ESP_OK;
             }
         }
@@ -836,12 +868,21 @@ static esp_err_t transmit_built_packet(const uint8_t *packet)
     t.length = RP_STREAM_PACKET_BYTES * 8;
     t.tx_buffer = packet;
 
+    /* READY is high here; its next fall says the RP has the whole packet. */
+    uint32_t falls = s_ready_falls;
+
     esp_err_t ret = spi_device_transmit(s_payload_spi, &t);
     if (ret != ESP_OK) {
+        s_status.payload_spi_errors++;
         return ret;
     }
 
-    return wait_rp_ready_low(100000);
+    ret = wait_rp_ready_fall(falls, 100000);
+    if (ret != ESP_OK) {
+        s_status.payload_ack_timeouts++;
+    }
+
+    return ret;
 }
 
 static void payload_record_tx_result(esp_err_t ret)
@@ -871,6 +912,9 @@ static void payload_tx_task(void *arg)
         if (slot->generation == generation) {
             s_payload_tx_busy = true;
             esp_err_t ret = wait_rp_ready_high(500000);
+            if (ret != ESP_OK) {
+                s_status.payload_ready_timeouts++;
+            }
 
             generation = __atomic_load_n(&s_stream_generation, __ATOMIC_ACQUIRE);
             if (ret == ESP_OK && slot->generation == generation) {

@@ -791,6 +791,12 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
             "\"remote_stream_bad_packets\":%lu,"
             "\"remote_stream_dropped_packets\":%lu,"
             "\"remote_stream_rx_timeouts\":%lu,"
+            "\"remote_seq_gaps\":%lu,"
+            "\"remote_seq_missing\":%lu,"
+            "\"remote_rx_partial\":%lu,"
+            "\"payload_ready_timeouts\":%lu,"
+            "\"payload_spi_errors\":%lu,"
+            "\"payload_ack_timeouts\":%lu,"
             "\"sd_inserted\":%s,"
             "\"sd_mounted\":%s,"
             "\"sd_file_count\":%d,"
@@ -836,6 +842,12 @@ static esp_err_t rp_status_get_handler(httpd_req_t *req)
         (unsigned long)rp.remote_stream_bad_packets,
         (unsigned long)rp.remote_stream_dropped_packets,
         (unsigned long)rp.remote_stream_rx_timeouts,
+        (unsigned long)rp.remote_seq_gaps,
+        (unsigned long)rp.remote_seq_missing,
+        (unsigned long)rp.remote_rx_partial,
+        (unsigned long)rp.payload_ready_timeouts,
+        (unsigned long)rp.payload_spi_errors,
+        (unsigned long)rp.payload_ack_timeouts,
         sd.inserted ? "true" : "false",
         sd.mounted ? "true" : "false",
         sd.file_count,

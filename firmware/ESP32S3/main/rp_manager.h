@@ -65,6 +65,15 @@ typedef struct {
     uint32_t remote_stream_bad_packets;
     uint32_t remote_stream_dropped_packets;
     uint32_t remote_stream_rx_timeouts;
+    uint32_t remote_seq_gaps;         /* RP: breaks in the packet sequence within a stream */
+    uint32_t remote_seq_missing;      /* RP: packets missing across those breaks */
+    uint32_t remote_rx_partial;       /* RP: receives that timed out mid-packet */
+
+    /* Packets the ESP32 failed to deliver: READY never rose (packet dropped),
+       the SPI transfer failed, or READY never fell after it. */
+    uint32_t payload_ready_timeouts;
+    uint32_t payload_spi_errors;
+    uint32_t payload_ack_timeouts;
 
     bool test_stream_running;
     uint32_t test_stream_blocks_sent;
