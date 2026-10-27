@@ -264,7 +264,7 @@ The board treats the scanners as the fragile part. From RP2354 firmware 0.2.0 an
 | `/api/rp/color_shift?value=<-2000..2000>` | POST | Apply the colour shift in microseconds; saved at once while output is stopped |
 | `/api/rp/color_shift?save=1` | POST | Save the applied colour shift; refused while output runs |
 
-`/api/rp/status` adds `rate_limit`, `remote_max_rate`, `remote_requested_rate`, `remote_color_shift_us`, `remote_color_shift_samples`, `remote_color_shift_saved`, `remote_max_lit_step`, `remote_lit_big_steps`, `remote_blank_big_steps`, `remote_stale_packets` and per-protocol `stream_*_dropped` counters for points a protocol received but could not queue.
+`/api/rp/status` adds `rate_limit`, `remote_max_rate`, `remote_requested_rate`, `remote_color_shift_us`, `remote_color_shift_samples`, `remote_color_shift_saved`, `remote_max_lit_step`, `remote_lit_big_steps`, `remote_blank_big_steps`, `remote_stale_packets` and per-protocol `stream_*_dropped` counters for points a protocol received but could not queue. Packets lost on the way to the RP2354 show up as `remote_seq_gaps` / `remote_seq_missing` (breaks in the packet sequence), `remote_rx_partial` (receives abandoned mid-packet), and the ESP32-S3's own `payload_ready_timeouts`, `payload_spi_errors` and `payload_ack_timeouts`.
 
 `tools/hwtest.py` exercises these behaviours on a board (rate clamps, stop and cancel paths, underrun hold, overrun, throughput, IDN packet-size loss) and refuses to run while anything is outputting. `tools/ild_inspect.py` reports the largest lit and blanked steps in `.ild` files. `docs/galvo-safety-review.md` has the findings, measurements and the tuning roadmap; `docs/research/` has the background on the hardware, the protocols and ILDA tuning practice.
 
@@ -279,7 +279,8 @@ The log reports:
 - Firmware version, whether the last reset came from the watchdog, and the buffer and mirror settings (printed once, when the port is first opened)
 - Every command from the ESP32-S3: `START`, `STOP`, `CLEAR`, `RATE`, `LIMIT`, `SHIFT`, `BUFFER`, `MIRROR`
 - Once per second while running: output mode, underruns, failsafe blanking, buffer fill, and the last commanded X/Y position
-- Once per second, if any occurred: bad, dropped, or timed-out stream packets
+- Once per second, if any occurred: bad, dropped, or timed-out stream packets, and breaks in the packet sequence
+- A `lit_jump` line for each lit step of 1/8 full scale or more, with its start and end position and where it fell in the 256-sample stream packet
 
 The output engine is always in one of these modes:
 

@@ -153,6 +153,13 @@ streams, and 20,915 to 23,737 with one to three lit big steps for others:
 the test client restarts its circle at point zero after prefilling, a lit
 jump of about 35 percent of full scale. A real client doing the same would
 show up the same way in `remote_max_lit_step` and `remote_lit_big_steps`.
+Fixed in the test client (2026-10-27): it now continues the circle where
+the prefill stopped. Since the circle's first point is blanked, the restart
+counted as one blanked big step per stream, and with the colour shift on,
+the colours of the last lit points ran into the start of the jump: the
+owner saw a fixed lit streak on every test stream. After the fix,
+`blank_big_steps` read 0 in all 44 reports of 20 `ed-stop-residue` cycles and
+the streak was gone.
 
 ### F14. No colour/blanking delay control. Fixed+verified (2026-10-24).
 The scanners lag the commanded position by 100 us or more and the colours do
@@ -202,6 +209,41 @@ output too. Verified: a host test over all 36 pattern pairs kept lit steps at
 the patterns' own (largest 2,893, the circle's seam); on the board, switching
 Square, Colour Shift, Circle, Heart gave 0 lit big steps, and Square then
 Stop Stream logged `output ref 1 -> 0, STOP ESP_OK` with output stopped.
+
+### F16. Lost SPI packets drew lit chords across the image. Fixed+verified (2026-10-27).
+The owner saw "ghost flickers": lit lines cutting across test circles at
+random angles. The RP2354 waits for each 256-sample packet from the ESP32
+with READY raised and a 10 ms timeout; on timeout it dropped READY and
+aborted the receive DMA. A packet the ESP32 had begun in the last
+millisecond of the wait (4,108 bytes at 32 MHz) was cut off, the next packet
+arrived normally, and neither chip counted anything: the stream skipped 256
+samples, which on the 480-point test circles is a lit jump of about 191
+degrees (largest steps 43,652 / 23,884 / 15,922 for radius 22,000 / 12,000 /
+8,000, one lost packet each). New counters proved it: in one run of four
+tests the RP saw 179 sequence gaps of exactly one packet, 362 receives cut
+mid-packet, and all 150 logged lit jumps fell on the first sample of a
+packet.
+
+Fix, in two parts. RP: once READY is up it stays up with the DMA armed
+until a whole packet is in; a timeout only returns to the main loop. That
+exposed an ESP32 weakness the old timeout had hidden: after each transmit it
+polled READY's level for the RP's short low between packets, and missed it
+when the sending task was held off, then waited 100 ms (542 such stalls in
+one run, Ether Dream at 50 kpps down to 19.3k points/s). ESP: a GPIO
+interrupt counts READY's falling edges and the sender waits for one.
+
+Verified: 20 repeats of `ed-stop-residue`, `ed-underrun-hold`,
+`idn-packet-size` and `throughput` with 0 sequence gaps, 0 cut receives and
+0 stalls in every run; IDN underruns 0/s at 30k, 40k and 50k (up to 5,884/s
+before); the owner ran Modulaser over Ether Dream and IDN at 40 kpps with
+the laser on and saw no chords (0 gaps, 0 lit jumps logged).
+
+### F17. IDN points lost in bursts before the ESP32 sees them. Measured; cause open.
+In 4 of the 20 soak runs above, about one second of IDN points (38,500 at
+40 kpps; 19.3% of a 50 kpps run) never reached the ESP32's IDN ring: its
+drop counter and the RP's sequence counter both stayed at 0. IDN is UDP, so
+the W5500's receive buffer or the network are the candidates. Next step:
+count gaps in the IDN packet sequence numbers on the ESP32.
 
 ### Owner's verification, same evening
 With both 0.2.0 firmwares and Modulaser over IDN: test frames "dead exact
@@ -326,6 +368,11 @@ which the client does not count.
   while stopped, `SHIFT save`; STATUS `color_shift_us`,
   `color_shift_samples`, `color_shift_saved`.
 
+- `stream_rx.c` (2026-10-27): the receive stays armed across timeouts
+  (F16); STATUS `seq_gaps`, `seq_missing`, `rx_partial`; the console log
+  prints a `lit_jump` line for each lit big step with its position in the
+  stream packet.
+
 Flashed with `picotool load -f -x build/ILDAWaveX16V2-RP2350.uf2` after
 the cable flip; `hwtest.py all` passed 12 of 13 against it (the failure is
 the test client stalling for a second during `ed-rate-change`). The RP USB
@@ -351,6 +398,11 @@ log was kept locally.
   controls; `remote_color_shift_*` and `remote_stale_packets` in the status
   JSON; the Colour Shift test pattern; blanked moves between test patterns;
   Stop Stream stops everything.
+- 2026-10-27: the sender waits for READY's falling edge, counted in a GPIO
+  interrupt (F16); status `remote_seq_gaps`, `remote_seq_missing`,
+  `remote_rx_partial`, `payload_ready_timeouts`, `payload_spi_errors`,
+  `payload_ack_timeouts`; the Colour Shift pattern redrawn to the owner's
+  design and its calibration (Show pattern, steps, Save) on one card.
 
 ## 5. Plan: standard ILDA tuning
 
@@ -407,8 +459,9 @@ when parked), ILW moved off the RP BUFFER command.
 - The ESP build that re-syncs the rate limit on every status read is
   flashed; the disagreeing case itself (RP rebooting with an older flash
   copy) was not reproduced after the flash, only the agreeing case.
-- Fix the test client so `ed_feed` continues the pattern where the prefill
-  stopped; the step counters flagged the restart.
+- F17: find where IDN loses about a second of points in some runs.
+- `ed-rate-change` still sees one second of underruns at the 30k to 20k
+  switch; the 1.2 s client stall it used to show went with F16.
 - Confirm the DAC80508 variant (Z or M) from the chip marking; it decides
   what the outputs do between power-on and the first park write.
 - Isolate F8: re-run `idn-packet-size` after long uptime and after heavy
