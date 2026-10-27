@@ -490,40 +490,46 @@ static void line_point(int32_t ax, int32_t ay,
 }
 
 /*
-   Colour shift test frame, half scale. White rows, alternately drawn left
-   to right and right to left, cross three fixed columns (red, green, blue).
-   Each row is blanked for a short index gap centred on each column. A
-   column does not move sideways with the colour shift; a row's gaps slide
-   along its direction of travel. With the shift right, every row's gaps sit
-   on the columns; wrong, the gaps of neighbouring rows stagger opposite ways.
+   Colour shift test frame, half scale. Three columns, red, green and blue,
+   each with a pair of short white lines drawn left to right: the upper one
+   ends at the column, the lower one starts there. A column does not move
+   sideways with the colour shift; a line slides along its direction of
+   travel, so with the colours late the upper line crosses its column and
+   the lower one leaves a gap, and early the other way round. The right
+   shift has both lines just touching the column. The beam runs on blanked
+   through the column after the upper line, and runs up blanked into the
+   lower one, at line speed, so an error shows as the line extending along
+   itself and the scanners do not slow at the column.
 */
-#define CS_ROW_X    16000
 #define CS_COL_X    10000
-#define CS_COL_Y    14000
-#define CS_GAP_HALF 800
+#define CS_COL_Y    9000
+#define CS_LINE     6000
+#define CS_UPPER_Y  4000
+#define CS_LOWER_Y  (-4000)
+#define CS_RUN      1000    /* blanked run past/into the column at line speed */
 
 typedef struct {
     int16_t ax, ay, bx, by;
     uint16_t samples;
     uint8_t color;      /* colour bits; 0 = blanked move */
-    bool index_gaps;
 } test_segment_t;
 
+/* One column's lines and column. The blanked move in starts at the top of the
+   previous column, from_x, and takes move samples. */
+#define CS_COLUMN(cx, from_x, move, color)                                                  \
+    { (from_x), CS_COL_Y, (cx) - CS_LINE, CS_UPPER_Y, (move), 0 },                        \
+    { (cx) - CS_LINE, CS_UPPER_Y, (cx), CS_UPPER_Y, 48, 7 },                          \
+    { (cx), CS_UPPER_Y, (cx) + CS_RUN, CS_UPPER_Y, 8, 0 },                            \
+    { (cx) + CS_RUN, CS_UPPER_Y, (cx) - CS_RUN, CS_LOWER_Y, 32, 0 },                  \
+    { (cx) - CS_RUN, CS_LOWER_Y, (cx), CS_LOWER_Y, 8, 0 },                            \
+    { (cx), CS_LOWER_Y, (cx) + CS_LINE, CS_LOWER_Y, 48, 7 },                          \
+    { (cx) + CS_LINE, CS_LOWER_Y, (cx), -CS_COL_Y, 32, 0 },                           \
+    { (cx), -CS_COL_Y, (cx), CS_COL_Y, 104, (color) }
+
 static const test_segment_t s_color_shift_frame[] = {
-    { -CS_ROW_X,  -9000,  CS_ROW_X,  -9000, 192, 7, true },
-    {  CS_ROW_X,  -9000,  CS_ROW_X,  -3000,  32, 0, false },
-    {  CS_ROW_X,  -3000, -CS_ROW_X,  -3000, 192, 7, true },
-    { -CS_ROW_X,  -3000, -CS_ROW_X,   3000,  32, 0, false },
-    { -CS_ROW_X,   3000,  CS_ROW_X,   3000, 192, 7, true },
-    {  CS_ROW_X,   3000,  CS_ROW_X,   9000,  32, 0, false },
-    {  CS_ROW_X,   9000, -CS_ROW_X,   9000, 192, 7, true },
-    { -CS_ROW_X,   9000, -CS_COL_X, -CS_COL_Y, 64, 0, false },
-    { -CS_COL_X, -CS_COL_Y, -CS_COL_X, CS_COL_Y, 160, 1, false },
-    { -CS_COL_X,  CS_COL_Y,  0,  CS_COL_Y,   32, 0, false },
-    {  0,  CS_COL_Y,  0, -CS_COL_Y,         160, 2, false },
-    {  0, -CS_COL_Y,  CS_COL_X, -CS_COL_Y,   32, 0, false },
-    {  CS_COL_X, -CS_COL_Y,  CS_COL_X, CS_COL_Y, 160, 4, false },
-    {  CS_COL_X,  CS_COL_Y, -CS_ROW_X, -9000, 96, 0, false },
+    CS_COLUMN(-CS_COL_X,  CS_COL_X, 96, 1),
+    CS_COLUMN(0,         -CS_COL_X, 48, 2),
+    CS_COLUMN(CS_COL_X,   0,        48, 4),
 };
 
 #define CS_SEGMENTS (sizeof(s_color_shift_frame) / sizeof(s_color_shift_frame[0]))
@@ -551,15 +557,6 @@ static uint8_t color_shift_point(uint32_t p, uint8_t color_mask, int32_t *x, int
 
     if (seg->color == 0) {
         return 0;
-    }
-
-    if (seg->index_gaps) {
-        for (int32_t cx = -CS_COL_X; cx <= CS_COL_X; cx += CS_COL_X) {
-            int32_t dx = *x - cx;
-            if (dx > -CS_GAP_HALF && dx < CS_GAP_HALF) {
-                return 0;
-            }
-        }
     }
 
     /* A single-colour laser still sees every column in its own colour. */

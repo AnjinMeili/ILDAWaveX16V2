@@ -176,11 +176,14 @@ within two path steps (300 units against a 150-unit path). And each SHIFT
 wrote RP flash, which pauses the RP while the laser draws; a SHIFT now saves
 only while output is stopped, and `SHIFT save` is refused while running.
 
-A Colour Shift test pattern (Test Stream) draws four white rows, alternately
-left to right and right to left, across red, green and blue columns, with
-index gaps where each row crosses a column. A wrong shift staggers the gaps
-of neighbouring rows in opposite directions (+-502 units for 3 samples in
-simulation); the right shift lines them up. Verified on the board: the RP
+A Colour Shift test pattern (Test Stream) draws red, green and blue
+columns, each with two short white lines drawn left to right: the upper
+one ends at the column, the lower one starts there, and the beam runs
+through the column blanked at line speed. Too little shift stops the upper
+line short and carries the lower one across the column; too much does the
+reverse; the right shift has both just touching. (Changed 2026-10-27 to
+the owner's design; the first version blanked a short index gap on each
+column, and a wrong shift staggered the gaps of neighbouring rows.) Verified on the board: the RP
 settings survived the flash (with upstream's 2 MiB flash size), the owner
 stepped the shift live and judged the pattern "works just like it should",
 and saved 140 us (4 samples at 30 kpps).
