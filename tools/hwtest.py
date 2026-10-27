@@ -144,19 +144,23 @@ def ed_connect(host: str, tries: int = 24) -> EtherDreamSender:
     raise ConnectionError(f"Ether Dream connect failed: {last}")
 
 
-def ed_prefill(s: EtherDreamSender, points, count: int, pkt: int = 256) -> bytes:
-    """Prepare and queue `count` points without Begin. Returns the last ACK."""
+def ed_prefill(s: EtherDreamSender, points, count: int, pkt: int = 256) -> int:
+    """Prepare and queue `count` points without Begin.
+
+    Returns the index of the next point, for ed_feed(start=...): restarting
+    the drawing at point 0 instead puts a jump in the stream.
+    """
     s.stop()
     s.prepare()
-    sent, idx, raw = 0, 0, b""
+    sent, idx = 0, 0
     while sent < count:
         batch = []
         for _ in range(min(pkt, count - sent)):
             batch.append(points[idx])
             idx = (idx + 1) % len(points)
-        raw = s.send_points_retry_full(batch)
+        s.send_points_retry_full(batch)
         sent += len(batch)
-    return raw
+    return idx
 
 
 def ed_update_rate(s: EtherDreamSender, rate: int) -> bytes:
@@ -172,15 +176,17 @@ def ed_build_data(s: EtherDreamSender, points) -> bytes:
 
 
 def ed_feed(s: EtherDreamSender, points, rate: int, seconds: float,
-            target_fullness: int = 4000, pkt: int = 300, depth: int = 2, on_rate=None) -> dict:
+            target_fullness: int = 4000, pkt: int = 300, depth: int = 2, on_rate=None,
+            start: int = 0) -> dict:
     """Keep the DAC's reported fullness near target for `seconds`.
 
     `depth` data commands may be in flight before the first ACK is read
     (Ether Dream allows pipelining). on_rate(elapsed_s) may return a new
-    rate to apply with 'u'. Returns client-side statistics, including the
-    per-command round trip (send to ACK) in ms.
+    rate to apply with 'u'. Points are taken from index `start` on. Returns
+    client-side statistics, including the per-command round trip (send to
+    ACK) in ms, and "next_idx" for a following call.
     """
-    idx = 0
+    idx = start
     t0 = time.perf_counter()
     end = t0 + seconds
     sent = 0
@@ -229,7 +235,7 @@ def ed_feed(s: EtherDreamSender, points, rate: int, seconds: float,
             "rtt_ms_med": round(rtts[len(rtts) // 2], 1) if rtts else None,
             "rtt_ms_p95": round(rtts[int(len(rtts) * 0.95)], 1) if rtts else None,
             "rtt_ms_max": round(rtts[-1], 1) if rtts else None,
-            "fullness_min": fullness_min, "fullness_max": fullness_max}
+            "fullness_min": fullness_min, "fullness_max": fullness_max, "next_idx": idx}
 
 
 # -- IDN helpers -------------------------------------------------------------
@@ -380,10 +386,11 @@ def t_ed_pacing(ctx) -> Result:
     pts = make_circle(8000, 360)
     s = ed_connect(ctx.host)
     try:
-        ed_prefill(s, pts, 3072)
+        idx = ed_prefill(s, pts, 3072)
         s.begin(30000, 0)
         for pkt in (100, 300, 600, 1000):
-            feed = ed_feed(s, pts, 30000, 2.5, pkt=pkt, depth=1)
+            feed = ed_feed(s, pts, 30000, 2.5, pkt=pkt, depth=1, start=idx)
+            idx = feed.pop("next_idx")
             feed["sync_pps_limit"] = round(pkt * 1000.0 / feed["rtt_ms_med"]) if feed["rtt_ms_med"] else None
             res.rows.append(feed)
         s.command(b"s")
@@ -474,9 +481,9 @@ def t_ed_stop_residue(ctx) -> Result:
     for i in range(ctx.repeat):
         s = ed_connect(ctx.host)
         try:
-            ed_prefill(s, pts, 3072)
+            idx = ed_prefill(s, pts, 3072)
             s.begin(30000, 0)
-            ed_feed(s, pts, 30000, 1.5, target_fullness=6000)
+            ed_feed(s, pts, 30000, 1.5, target_fullness=6000, start=idx)
             s.command(b"s")
         finally:
             s.close()
@@ -539,10 +546,11 @@ def t_ed_rate_change(ctx) -> Result:
     sampler = Sampler(ctx.host)
     s = ed_connect(ctx.host)
     try:
-        ed_prefill(s, pts, 3072)
+        idx = ed_prefill(s, pts, 3072)
         s.begin(phases[0], 0)
         sampler.start()
-        feed = ed_feed(s, pts, phases[0], 6.0, on_rate=on_rate)
+        feed = ed_feed(s, pts, phases[0], 6.0, on_rate=on_rate, start=idx)
+        feed.pop("next_idx")
         s.command(b"s")
     finally:
         sampler.stop()
@@ -665,10 +673,11 @@ def t_throughput(ctx) -> Result:
             if proto == "etherdream":
                 s = ed_connect(ctx.host)
                 try:
-                    ed_prefill(s, pts, 3072)
+                    idx = ed_prefill(s, pts, 3072)
                     s.begin(rate, 0)
                     sampler.start()
-                    feed = ed_feed(s, pts, rate, seconds)
+                    feed = ed_feed(s, pts, rate, seconds, start=idx)
+                    feed.pop("next_idx")
                     s.command(b"s")
                 finally:
                     sampler.stop()
