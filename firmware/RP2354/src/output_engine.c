@@ -10,6 +10,7 @@
 #include "ring_buffer.h"
 #include "dac80508.h"
 #include "output_engine.h"
+#include "stream_rx.h"
 #include "project_config.h"
 
 #define OUTPUT_DEFAULT_SAMPLE_RATE_HZ 30000
@@ -78,6 +79,10 @@ static uint32_t s_shift_pos = 0;
 static volatile uint32_t s_max_lit_step = 0;
 static volatile uint32_t s_lit_big_steps = 0;
 static volatile uint32_t s_blank_big_steps = 0;
+
+static uint32_t s_stream_valid_samples = 0;   /* since START, core 1 only */
+static output_lit_jump_t s_lit_jumps[OUTPUT_LIT_JUMP_LOG];
+static volatile uint32_t s_lit_jump_serial = 0;
 
 static int16_t s_last_output[RP_SAMPLE_CHANNELS];
 
@@ -294,6 +299,18 @@ static void note_valid_sample(const int16_t sample[RP_SAMPLE_CHANNELS])
             }
             if (step >= BIG_STEP_THRESHOLD) {
                 s_lit_big_steps++;
+
+                uint32_t serial = s_lit_jump_serial + 1u;
+                output_lit_jump_t *j = &s_lit_jumps[serial % OUTPUT_LIT_JUMP_LOG];
+
+                j->serial = serial;
+                j->sample = s_stream_valid_samples;
+                j->pos = s_stream_valid_samples % STREAM_SAMPLES_PER_PACKET;
+                j->from_x = s_last_valid_x;
+                j->from_y = s_last_valid_y;
+                j->to_x = sample[0];
+                j->to_y = sample[1];
+                __atomic_store_n(&s_lit_jump_serial, serial, __ATOMIC_RELEASE);
             }
         } else if (step >= BIG_STEP_THRESHOLD) {
             s_blank_big_steps++;
@@ -303,6 +320,7 @@ static void note_valid_sample(const int16_t sample[RP_SAMPLE_CHANNELS])
     s_last_valid_x = sample[0];
     s_last_valid_y = sample[1];
     s_have_valid_xy = true;
+    s_stream_valid_samples++;
     s_last_valid_sample_time = get_absolute_time();
 }
 
@@ -784,6 +802,7 @@ void output_engine_start(void)
     s_max_lit_step = 0;
     s_lit_big_steps = 0;
     s_blank_big_steps = 0;
+    s_stream_valid_samples = 0;
 
     {
         int16_t parked[RP_SAMPLE_CHANNELS];
@@ -949,4 +968,23 @@ void output_engine_get_status(output_engine_status_t *status)
     memcpy(status->last_output, s_last_output, sizeof(status->last_output));
 
     critical_section_exit(&s_output_cs);
+}
+
+uint32_t output_engine_get_lit_jumps(output_lit_jump_t *out, uint32_t max, uint32_t *serial)
+{
+    uint32_t latest = __atomic_load_n(&s_lit_jump_serial, __ATOMIC_ACQUIRE);
+    uint32_t first = *serial + 1u;
+    uint32_t n = 0;
+
+    if (latest - *serial > OUTPUT_LIT_JUMP_LOG) {
+        first = latest - OUTPUT_LIT_JUMP_LOG + 1u;
+    }
+
+    /* Core 1 may overwrite an entry while it is copied; diagnostics only. */
+    for (uint32_t s = first; s != latest + 1u && n < max; s++) {
+        out[n++] = s_lit_jumps[s % OUTPUT_LIT_JUMP_LOG];
+    }
+
+    *serial = latest;
+    return n;
 }

@@ -99,7 +99,7 @@ void uart_send_line(const char *s)
 
 static void send_status(void)
 {
-    static char line[640];   /* core 0 only; keeps STATUS off the stack */
+    static char line[768];   /* core 0 only; keeps STATUS off the stack */
 
     stream_rx_status_t rx;
     output_engine_status_t out;
@@ -130,6 +130,9 @@ static void send_status(void)
         "lit_big_steps=%lu "
         "blank_big_steps=%lu "
         "stale_packets=%lu "
+        "seq_gaps=%lu "
+        "seq_missing=%lu "
+        "rx_partial=%lu "
         "color_shift_us=%ld "
         "color_shift_samples=%lu "
         "color_shift_saved=%lu",
@@ -154,6 +157,9 @@ static void send_status(void)
         (unsigned long)out.lit_big_steps,
         (unsigned long)out.blank_big_steps,
         (unsigned long)rx.stream_stale_packets,
+        (unsigned long)rx.seq_gaps,
+        (unsigned long)rx.seq_missing,
+        (unsigned long)rx.rx_partial,
         (long)out.color_shift_us,
         (unsigned long)out.color_shift_samples,
         s_color_shift_unsaved ? 0ul : 1ul

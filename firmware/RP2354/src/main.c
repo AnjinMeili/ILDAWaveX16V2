@@ -45,6 +45,7 @@ static void log_runtime_changes(void)
     static output_engine_status_t previous_output;
     static stream_rx_status_t previous_rx;
     static uint32_t previous_dma_words;
+    static uint32_t lit_jump_serial;
 
     if (!rp_log_console_connected()) {
         /* Re-baseline on reconnect so deltas cover only the attached period. */
@@ -101,13 +102,32 @@ static void log_runtime_changes(void)
     uint32_t bad_delta = rx.stream_bad_packets - previous_rx.stream_bad_packets;
     uint32_t dropped_delta = rx.stream_dropped_packets - previous_rx.stream_dropped_packets;
     uint32_t timeout_delta = rx.stream_rx_timeouts - previous_rx.stream_rx_timeouts;
+    uint32_t gap_delta = rx.seq_gaps - previous_rx.seq_gaps;
+    uint32_t missing_delta = rx.seq_missing - previous_rx.seq_missing;
+    uint32_t partial_delta = rx.rx_partial - previous_rx.rx_partial;
 
-    if (bad_delta > 0 || dropped_delta > 0 || (output.running && timeout_delta > 0)) {
-        rp_log("stream_errors bad=+%lu dropped=+%lu rx_timeout=+%lu payload_errors=%lu",
+    if (bad_delta > 0 || dropped_delta > 0 || gap_delta > 0 || partial_delta > 0 ||
+        (output.running && timeout_delta > 0)) {
+        rp_log("stream_errors bad=+%lu dropped=+%lu rx_timeout=+%lu payload_errors=%lu seq_gaps=+%lu seq_missing=+%lu rx_partial=+%lu",
                (unsigned long)bad_delta,
                (unsigned long)dropped_delta,
                (unsigned long)(output.running ? timeout_delta : 0),
-               (unsigned long)rx.payload_errors);
+               (unsigned long)rx.payload_errors,
+               (unsigned long)gap_delta,
+               (unsigned long)missing_delta,
+               (unsigned long)partial_delta);
+    }
+
+    output_lit_jump_t jumps[4];
+    uint32_t njumps = output_engine_get_lit_jumps(jumps, 4, &lit_jump_serial);
+
+    for (uint32_t i = 0; i < njumps; i++) {
+        rp_log("lit_jump n=%lu sample=%lu pos=%lu from=(%d,%d) to=(%d,%d)",
+               (unsigned long)jumps[i].serial,
+               (unsigned long)jumps[i].sample,
+               (unsigned long)jumps[i].pos,
+               jumps[i].from_x, jumps[i].from_y,
+               jumps[i].to_x, jumps[i].to_y);
     }
 
     previous_output = output;
@@ -180,6 +200,8 @@ int main(void)
             if (stream_rx_receive_packet(10)) {
                 stream_rx_process_packet();
             }
+        } else {
+            stream_rx_cancel();
         }
 #else
         rp_uart_poll();

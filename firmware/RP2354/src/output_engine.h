@@ -51,3 +51,20 @@ void output_engine_set_mirror(bool mirror_x, bool mirror_y);
 void output_engine_get_mirror(bool *mirror_x, bool *mirror_y);
 
 void output_engine_get_status(output_engine_status_t *status);
+
+/*
+   Diagnostics: the most recent lit big steps, with where they fell in the
+   stream. pos is the sample's offset in its 256-sample stream packet (0 is
+   the first sample of a packet), counted from START.
+*/
+typedef struct {
+    uint32_t serial;     /* 1, 2, 3 ... since boot */
+    uint32_t sample;     /* valid samples played since START */
+    uint32_t pos;
+    int16_t from_x, from_y, to_x, to_y;
+} output_lit_jump_t;
+
+#define OUTPUT_LIT_JUMP_LOG 8
+
+/* Copies the logged jumps newer than *serial, oldest first; returns the count. */
+uint32_t output_engine_get_lit_jumps(output_lit_jump_t *out, uint32_t max, uint32_t *serial);
