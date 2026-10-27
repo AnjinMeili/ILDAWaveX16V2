@@ -490,6 +490,39 @@ static bool preroll_next(int16_t sample[RP_SAMPLE_CHANNELS])
 
 /* -- Output paths ----------------------------------------------------------- */
 
+/*
+   Write to the DAC and record where the scanners go, together. If STOP
+   arrived while the samples were prepared, do neither: STOP waits for this
+   core to go idle, then ramps from the last position really written.
+*/
+static void submit_sample(const int16_t *sample)
+{
+    if (!s_running) {
+        return;
+    }
+
+    critical_section_enter_blocking(&s_output_cs);
+    memcpy(s_last_output, sample, RP_SAMPLE_CHANNELS * sizeof(int16_t));
+    critical_section_exit(&s_output_cs);
+
+    dac_write_sample(sample);
+}
+
+static void submit_batch(void)
+{
+    if (!s_running) {
+        return;
+    }
+
+    critical_section_enter_blocking(&s_output_cs);
+    memcpy(s_last_output,
+           s_batch[OUTPUT_BATCH_SAMPLES - 1],
+           RP_SAMPLE_CHANNELS * sizeof(int16_t));
+    critical_section_exit(&s_output_cs);
+
+    dac_write_sample_batch((const int16_t (*)[RP_SAMPLE_CHANNELS])s_batch, OUTPUT_BATCH_SAMPLES);
+}
+
 static void output_one_sample_timed(absolute_time_t *next_time)
 {
     int16_t sample[RP_SAMPLE_CHANNELS];
@@ -523,11 +556,7 @@ static void output_one_sample_timed(absolute_time_t *next_time)
         color_shift_apply(sample);
         apply_output_mirror(sample);
 
-        critical_section_enter_blocking(&s_output_cs);
-        memcpy(s_last_output, sample, sizeof(sample));
-        critical_section_exit(&s_output_cs);
-
-        dac_write_sample(sample);
+        submit_sample(sample);
         return;
     }
 
@@ -538,13 +567,10 @@ static void output_one_sample_timed(absolute_time_t *next_time)
         apply_output_mirror(sample);
 
         critical_section_enter_blocking(&s_output_cs);
-        memcpy(s_last_output, sample, RP_SAMPLE_CHANNELS * sizeof(int16_t));
         s_consumed_samples++;
         critical_section_exit(&s_output_cs);
 
-        if (s_running) {
-            dac_write_sample(sample);
-        }
+        submit_sample(sample);
     } else {
         int16_t blanked[RP_SAMPLE_CHANNELS];
 
@@ -555,15 +581,12 @@ static void output_one_sample_timed(absolute_time_t *next_time)
 
         critical_section_enter_blocking(&s_output_cs);
         s_underruns++;
-        memcpy(s_last_output, blanked, sizeof(blanked));
         critical_section_exit(&s_output_cs);
 
         failsafe_check_no_samples();
 
         /* Underrun: blank the laser channels, hold X/Y where they are. */
-        if (s_running) {
-            dac_write_sample(blanked);
-        }
+        submit_sample(blanked);
     }
 }
 
@@ -585,15 +608,7 @@ static void output_preroll_batch(void)
         apply_output_mirror(s_batch[i]);
     }
 
-    critical_section_enter_blocking(&s_output_cs);
-    memcpy(s_last_output,
-           s_batch[OUTPUT_BATCH_SAMPLES - 1],
-           RP_SAMPLE_CHANNELS * sizeof(int16_t));
-    critical_section_exit(&s_output_cs);
-
-    if (s_running) {
-        dac_write_sample_batch((const int16_t (*)[RP_SAMPLE_CHANNELS])s_batch, OUTPUT_BATCH_SAMPLES);
-    }
+    submit_batch();
 }
 
 static void output_batch(void)
@@ -640,22 +655,14 @@ static void output_batch(void)
     critical_section_enter_blocking(&s_output_cs);
     s_consumed_samples += got;
     s_underruns += missing;
-    memcpy(s_last_output,
-           s_batch[OUTPUT_BATCH_SAMPLES - 1],
-           RP_SAMPLE_CHANNELS * sizeof(int16_t));
     critical_section_exit(&s_output_cs);
 
     if (missing > 0) {
         failsafe_check_no_samples();
     }
 
-    /*
-       Missing samples inside the batch are blanked-hold-XY samples. If STOP
-       arrived meanwhile, write nothing: STOP moves the scanners itself.
-    */
-    if (s_running) {
-        dac_write_sample_batch((const int16_t (*)[RP_SAMPLE_CHANNELS])s_batch, OUTPUT_BATCH_SAMPLES);
-    }
+    /* Missing samples inside the batch are blanked-hold-XY samples. */
+    submit_batch();
 }
 
 /* -- Start / stop ----------------------------------------------------------- */
