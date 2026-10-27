@@ -7,7 +7,8 @@ DT50K galvo set rated 50 kpps. Companion material: `docs/research/hardware.md`
 (Ether Dream, IDN, ILDA file format) and `docs/research/ilda-tuning.md` (ILDA
 Test Pattern, tuning practice, point optimisation). Test tooling:
 `tools/hwtest.py` (board behaviour tests) and `tools/ild_inspect.py` (step
-analysis of .ild files).
+analysis of .ild files). The same review as a white paper, with the system
+diagram and charts: `docs/galvo-safe-laser-dac-firmware.pdf`.
 
 ## 1. What the output stage does with a DAC code
 
