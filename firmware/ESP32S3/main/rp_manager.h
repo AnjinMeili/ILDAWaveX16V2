@@ -97,6 +97,8 @@ esp_err_t rp_manager_set_color_shift(int32_t shift_us);
 /* Saves the applied colour shift to RP flash; fails while output runs. */
 esp_err_t rp_manager_save_color_shift(void);
 uint32_t rp_manager_get_rate_limit(void);
+/* The rate the RP runs now: kept current by RATE replies, limit changes and STATUS polls. */
+uint32_t rp_manager_get_sample_rate(void);
 esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,
                                        uint32_t high_water_samples,
                                        uint32_t low_water_samples);

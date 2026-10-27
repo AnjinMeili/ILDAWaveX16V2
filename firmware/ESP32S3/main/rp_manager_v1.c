@@ -480,8 +480,10 @@ static void output_task(void *arg)
 
     while (s_output_running) {
         uint32_t requested_rate = s_status.remote_sample_rate;
+        /* Small changes are IDN jitter, but never stay above the limit. */
         if (requested_rate > 0 &&
-            (requested_rate > active_rate + 500 || active_rate > requested_rate + 500)) {
+            (requested_rate > active_rate + 500 || active_rate > requested_rate + 500 ||
+             active_rate > s_status.rate_limit)) {
             active_rate = requested_rate;
             period_q32 = ((uint64_t)1000000 << 32) / active_rate;
             /* Don't reset next_q32 — let the resync check below absorb any
@@ -813,6 +815,11 @@ uint32_t rp_manager_get_rate_limit(void)
     return s_status.rate_limit;
 }
 
+uint32_t rp_manager_get_sample_rate(void)
+{
+    return s_status.remote_sample_rate;
+}
+
 esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz)
 {
     limit_hz = clamp_rate_limit(limit_hz);
@@ -827,9 +834,9 @@ esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz)
     s_status.remote_max_rate = limit_hz;
     ESP_LOGI(TAG, "Scanner rate limit set to %lu pps", (unsigned long)limit_hz);
 
-    /* A rate already above the new limit is pulled down now. */
-    if (s_status.remote_sample_rate > limit_hz) {
-        rp_manager_set_rate(limit_hz);
+    /* Re-apply the producer's rate under the new limit, raised or lowered. */
+    if (s_status.remote_requested_rate > 0) {
+        rp_manager_set_rate(s_status.remote_requested_rate);
     }
 
     return ESP_OK;

@@ -187,7 +187,6 @@ static uint8_t s_mac[6];
 static volatile uint8_t  s_le_state    = LE_READY;
 static volatile uint8_t  s_pb_state    = PB_IDLE;
 static volatile uint16_t s_pb_flags    = 0;
-static volatile uint32_t s_point_rate  = ED_DEFAULT_POINT_RATE;
 static volatile uint32_t s_point_count = 0;
 static volatile uint32_t s_rp_queued   = 0;   /* estimated samples queued on the RP */
 
@@ -298,7 +297,7 @@ static ed_dac_status_t make_status(void)
     uint32_t fill        = ring_size() + s_rp_queued;
     if (fill > ED_BUFFER_CAPACITY) fill = ED_BUFFER_CAPACITY;
     s.buffer_fullness    = (uint16_t)fill;
-    s.point_rate         = (s_pb_state == PB_IDLE) ? 0 : s_point_rate;
+    s.point_rate         = (s_pb_state == PB_IDLE) ? 0 : rp_manager_get_sample_rate();
     s.point_count        = s_point_count;
     return s;
 }
@@ -354,7 +353,8 @@ static uint32_t rp_queued_estimate(void)
     uint32_t sent  = s_rp_poll_sent;
     portEXIT_CRITICAL(&s_rp_poll_mux);
 
-    int64_t played = (int64_t)s_point_rate * (esp_timer_get_time() - at_us) / 1000000;
+    /* The RP's rate, not the client's: a scanner limit change moves it mid-stream. */
+    int64_t played = (int64_t)rp_manager_get_sample_rate() * (esp_timer_get_time() - at_us) / 1000000;
     int64_t queued = (int64_t)fill + (uint32_t)(s_rp_sent - sent) - played;
     return queued > 0 ? (uint32_t)queued : 0u;
 }
@@ -591,7 +591,7 @@ static void diag_maybe_log(int64_t now_us)
         rp_manager_get_status(&rp);
         ESP_LOGI(TAG, "diag %lu pps: d=%lu pts=%lu (%lu/s) avg=%lu ping=%lu full=%lu "
                  "fullness %lu..%lu avg %lu, wait %lldms max %lldms, payload %lldms, rp_fill=%lu est=%lu",
-                 (unsigned long)s_point_rate,
+                 (unsigned long)rp_manager_get_sample_rate(),
                  (unsigned long)s_diag.data_cmds, (unsigned long)s_diag.points,
                  (unsigned long)(s_diag.points * 1000000ull / (uint64_t)span),
                  (unsigned long)(s_diag.points / s_diag.data_cmds),
@@ -719,8 +719,7 @@ static void handle_client(int sock)
                 if (rate == 0) rate = ED_DEFAULT_POINT_RATE;
                 if (rate > ED_MAX_POINT_RATE) rate = ED_MAX_POINT_RATE;
                 uint32_t applied = rate;
-                rp_manager_set_rate_applied(rate, &applied);
-                s_point_rate   = applied;   /* status reports the rate really running */
+                rp_manager_set_rate_applied(rate, &applied);   /* status reports the rate really running */
                 s_pb_state     = PB_PLAYING;
                 s_output_armed = true;
                 ESP_LOGI(TAG, "Begin @ %lu pps (running %lu)", (unsigned long)rate, (unsigned long)applied);
@@ -744,7 +743,6 @@ static void handle_client(int sock)
                 if (rate > ED_MAX_POINT_RATE) rate = ED_MAX_POINT_RATE;
                 uint32_t applied = rate;
                 rp_manager_set_rate_applied(rate, &applied);
-                s_point_rate = applied;
                 ESP_LOGI(TAG, "Update @ %lu pps (running %lu)", (unsigned long)rate, (unsigned long)applied);
                 if (!send_response(sock, RESP_ACK, cmd)) break;
                 continue;
@@ -822,7 +820,6 @@ static void handle_client(int sock)
                             if (new_rate > 0 && new_rate <= ED_MAX_POINT_RATE) {
                                 uint32_t applied = new_rate;
                                 rp_manager_set_rate_applied(new_rate, &applied);
-                                s_point_rate = applied;
                                 ESP_LOGI(TAG, "Rate -> %lu pps (running %lu)", (unsigned long)new_rate, (unsigned long)applied);
                             }
                         }
@@ -894,7 +891,6 @@ disconnect:
     s_le_state     = LE_READY;
     s_pb_flags     = 0;
     s_point_count  = 0;
-    s_point_rate   = ED_DEFAULT_POINT_RATE;
 
     ESP_LOGI(TAG, "State reset - Idle/Ready for next client");
 

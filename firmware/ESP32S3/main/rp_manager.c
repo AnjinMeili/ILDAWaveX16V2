@@ -1343,6 +1343,9 @@ esp_err_t rp_manager_clear_buffer(void)
     return ret;
 }
 
+/* The rate the producer last asked for, before the limit; 0 = none yet. */
+static uint32_t s_wanted_rate = 0;
+
 esp_err_t rp_manager_set_rate_applied(uint32_t rate_hz, uint32_t *applied)
 {
     char cmd[64];
@@ -1351,6 +1354,8 @@ esp_err_t rp_manager_set_rate_applied(uint32_t rate_hz, uint32_t *applied)
     if (rate_hz < 1) {
         rate_hz = 1;
     }
+
+    s_wanted_rate = rate_hz;
 
     if (rate_hz > s_status.rate_limit) {
         ESP_LOGW(TAG, "Rate %lu above scanner limit %lu; clamped",
@@ -1456,12 +1461,29 @@ esp_err_t rp_manager_set_rate_limit(uint32_t limit_hz)
     ESP_LOGI(TAG, "Scanner rate limit set to %lu pps (RP: %s)",
              (unsigned long)limit_hz, esp_err_to_name(push_ret));
 
-    /* A rate already above the new limit is pulled down now. */
-    if (s_status.remote_sample_rate > limit_hz) {
-        rp_manager_set_rate(limit_hz);
+    /*
+       Re-apply the producer's rate under the new limit, so a lower limit
+       takes effect now and a higher one lets a clamped stream speed back up.
+       Protocols read the running rate back from here.
+    */
+    esp_err_t rate_ret = ESP_OK;
+    uint32_t wanted = s_wanted_rate ? s_wanted_rate : s_status.remote_sample_rate;
+    uint32_t target = wanted < limit_hz ? wanted : limit_hz;
+    if (target != s_status.remote_sample_rate) {
+        rate_ret = rp_manager_set_rate_applied(wanted, NULL);
     }
 
-    return ESP_OK;
+    /* Saved here, but an RP that did not take it is still running the old limit. */
+    if (push_ret != ESP_OK && push_ret != ESP_ERR_NOT_SUPPORTED) {
+        return push_ret;
+    }
+
+    return rate_ret;
+}
+
+uint32_t rp_manager_get_sample_rate(void)
+{
+    return s_status.remote_sample_rate;
 }
 
 esp_err_t rp_manager_set_buffer_config(uint32_t size_samples,
